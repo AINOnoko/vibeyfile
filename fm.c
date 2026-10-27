@@ -7,12 +7,15 @@
 #include <locale.h>
 #include <ncurses.h>
 #include <pwd.h>
+#include <grp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -21,10 +24,6 @@
 #ifndef CTRL
 #define CTRL(x) ((x) & 0x1f)
 #endif
-
-/* =========================================================================
- * КОНСТАНТЫ И ТИПЫ
- * ========================================================================= */
 
 #define MAX_NAME     256
 #define MIN_COLS     80
@@ -35,14 +34,29 @@
 #define NUM_TABS     4
 #define MAX_CLIP     256
 #define MAX_BOOKMARKS 64
+#define MAX_ASSOC    64
+#define MAX_BINDINGS 32
+#define VIEW_MAX_SIZE (5 * 1024 * 1024)
+#define MENU_MAX_VIS 16
+#define THEME_FIELDS 22
+#define CALC_SIZE_MAX_DEPTH 100
+#define MAX_ARGS     64
+
+#define COL_TYPE_MIN     52
+#define COL_DATE_MIN     38
+#define COL_SIZE_MIN     28
+
+#define NEW_FIELD_SEL_INACTIVE_BG  1
+#define NEW_FIELD_SEL_INACTIVE_FG  2
+#define NEW_FIELD_MARKED_BG        4
+#define NEW_FIELD_MARKED_FG        8
 
 enum {
     PAIR_SEL_ACTIVE = 1, PAIR_SEL_INACTIVE, PAIR_DIR, PAIR_EXEC,
     PAIR_HEADER, PAIR_TITLE, PAIR_TAB_ACTIVE, PAIR_TAB_INACTIVE,
     PAIR_QUIT, PAIR_QUIT_SEL, PAIR_GRAY_BG, PAIR_MARKED,
-    PAIR_BG, PAIR_DIALOG, PAIR_SHADOW,
-    PAIR_ROW_EVEN, PAIR_ROW_ODD, PAIR_DIR_EVEN, PAIR_DIR_ODD,
-    PAIR_EXEC_EVEN, PAIR_EXEC_ODD
+    PAIR_BG, PAIR_DIALOG, PAIR_SHADOW, PAIR_STATUS, PAIR_MENU_SEL,
+    PAIR_SCROLL
 };
 
 typedef enum { SORT_NAME, SORT_TYPE, SORT_DATE, SORT_SIZE, SORT_COUNT } SortField;
@@ -83,6 +97,7 @@ typedef struct {
     int       file_top;
     SortField sort_field;
     int       sort_desc;
+    char      pending_sel[MAX_NAME];
 } FilePane;
 
 typedef struct {
@@ -93,22 +108,39 @@ typedef struct {
 } TabState;
 
 typedef struct {
+    char ext[32];
+    char cmd[PATH_MAX];
+} Association;
+
+typedef struct {
+    char name[24];
+    int  key;
+} Binding;
+
+typedef struct {
     TabState tabs[NUM_TABS];
     int active_tab;
-    
+
     char clip_paths[MAX_CLIP][PATH_MAX];
     int  clip_count;
     int  clip_is_cut;
-    
+
     int  search_active;
     char search_buf[256];
     int  search_len;
-    
+
     char bookmarks[MAX_BOOKMARKS][PATH_MAX];
     int  bookmark_count;
-    
+
+    Association associations[MAX_ASSOC];
+    int         assoc_count;
+
+    Binding bindings[MAX_BINDINGS];
+    int     binding_count;
+
     int g_x_name[2], g_x_type[2], g_x_date[2], g_x_size[2];
     int running;
+    char last_action[PATH_MAX + 128];
 } AppState;
 
 typedef struct {
@@ -119,9 +151,34 @@ typedef struct {
     int last_pct;
 } CopyProgress;
 
-/* =========================================================================
- * ГЛОБАЛЬНОЕ СОСТОЯНИЕ И МАКРОСЫ
- * ========================================================================= */
+typedef struct {
+    char bg[8], fg[8];
+    char sel_bg[8], sel_fg[8];
+    char sel_inactive_bg[8], sel_inactive_fg[8];
+    char marked_bg[8], marked_fg[8];
+    char dir[8], exec[8];
+    char header_bg[8], header_fg[8];
+    char title_bg[8], title_fg[8];
+    char tab_active_bg[8], tab_active_fg[8];
+    char tab_inactive_bg[8], tab_inactive_fg[8];
+    char status_bg[8], status_fg[8];
+    char dialog_bg[8], dialog_fg[8];
+} ThemeConfig;
+
+typedef struct {
+    SortField field;
+    int       desc;
+} SortCtx;
+
+typedef struct {
+    int show_type, show_date, show_size;
+    int name_w;
+    int x_name, x_type, x_date, x_size;
+} PaneGeom;
+
+static ThemeConfig g_theme;
+static char g_theme_raw[4096] = "";
+static int g_new_theme_seen = 0;
 
 static AppState g_app;
 #define CURRENT_TAB (g_app.tabs[g_app.active_tab])
@@ -139,18 +196,31 @@ static int A_TAB_INACTIVE = A_REVERSE;
 static int A_MARKED       = A_REVERSE | A_BOLD;
 static int A_BUTTON       = A_NORMAL;
 static int A_BUTTON_SEL   = A_REVERSE | A_BOLD;
+static int A_MENU_SEL     = 0;
+static int A_MENU_NORMAL  = 0;
+static int A_SCROLL_THUMB = A_REVERSE;
+static int A_SCROLL_TRACK = 0;
 
-/* Прототипы */
 static void init_attributes(void);
 static int get_key(int raw_mode);
 static void handle_key(int ch);
 static void handle_mouse(MEVENT ev);
 static void switch_tab(int idx);
 static void draw(void);
-static void load_session(void);
-static void save_session(void);
+static void load_config(void);
+static void save_config(void);
 static void add_bookmark(const char *path);
 static int enter_dir(const char *path, FilePane *p);
+static void open_bookmark(const char *path);
+static void view_file(const char *path);
+static int is_text_file(const char *name);
+static int is_binary_content(const char *path);
+static void action_info(FilePane *p);
+static void launch_path(const char *name, const char *full);
+static void run_settings_menu(void);
+
+static char *theme_field_by_idx(int idx);
+static const char *theme_name_by_idx(int idx);
 
 static int run_menu(FilePane *p);
 static int run_submenu(const char *title, const char **options, int count);
@@ -164,6 +234,11 @@ static void action_archive(FilePane *p);
 static void action_unarchive(FilePane *p);
 static void action_refresh(FilePane *p);
 static void action_delete(FilePane *p);
+
+static void sig_handler(int sig) {
+    (void)sig;
+    g_app.running = 0;
+}
 
 /* =========================================================================
  * УТИЛИТЫ
@@ -182,6 +257,21 @@ static int utf8_strlen(const char *s) {
     for (; *s; s++)
         if (((unsigned char)*s & 0xC0) != 0x80) n++;
     return n;
+}
+
+static size_t utf8_prefix_bytes(const char *s, int max_chars) {
+    size_t bytes = 0;
+    int chars = 0;
+    while (s[bytes] && chars < max_chars) {
+        unsigned char c = s[bytes];
+        int step = 1;
+        if ((c & 0xE0) == 0xC0) step = 2;
+        else if ((c & 0xF0) == 0xE0) step = 3;
+        else if ((c & 0xF8) == 0xF0) step = 4;
+        bytes += step;
+        chars++;
+    }
+    return bytes;
 }
 
 static void build_padded(char *out, size_t outsz, const char *in, int width, int right) {
@@ -214,6 +304,20 @@ static void format_size(char *out, size_t outsz, off_t size) {
     while (v >= 1024.0 && u < 4) { v /= 1024.0; u++; }
     if (u == 0) snprintf(out, outsz, "%lld%s", (long long)size, units[0]);
     else        snprintf(out, outsz, "%.1f%s", v, units[u]);
+}
+
+static void format_mode(char *out, size_t outsz, mode_t mode) {
+    if (outsz < 10) { if (outsz) out[0] = '\0'; return; }
+    out[0] = (mode & S_IRUSR) ? 'r' : '-';
+    out[1] = (mode & S_IWUSR) ? 'w' : '-';
+    out[2] = (mode & S_IXUSR) ? 'x' : '-';
+    out[3] = (mode & S_IRGRP) ? 'r' : '-';
+    out[4] = (mode & S_IWGRP) ? 'w' : '-';
+    out[5] = (mode & S_IXGRP) ? 'x' : '-';
+    out[6] = (mode & S_IROTH) ? 'r' : '-';
+    out[7] = (mode & S_IWOTH) ? 'w' : '-';
+    out[8] = (mode & S_IXOTH) ? 'x' : '-';
+    out[9] = '\0';
 }
 
 static char file_icon(const char *name, int is_dir, mode_t mode) {
@@ -283,20 +387,532 @@ static int make_path(char *out, size_t outsz, const char *dir, const char *name)
     return 0;
 }
 
-static void shell_quote(char *out, size_t outsz, const char *in) {
-    size_t o = 0;
-    if (o < outsz - 1) out[o++] = '\'';
-    for (size_t i = 0; in[i] && o + 6 < outsz; i++) {
-        if (in[i] == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
-        else               { out[o++] = in[i]; }
+/* =========================================================================
+ * БЕЗОПАСНЫЙ ЗАПУСК ПРОЦЕССОВ (fork + execvp, без /bin/sh)
+ * ========================================================================= */
+
+static int tokenize_cmd(const char *cmd, char **argv, int max_args) {
+    if (!cmd || !*cmd || max_args < 2) return 0;
+    char *work = strdup(cmd);
+    if (!work) return 0;
+    int n = 0;
+    char *save = NULL;
+    char *tok = strtok_r(work, " \t\n\r", &save);
+    while (tok && n < max_args - 1) {
+        argv[n] = strdup(tok);
+        if (!argv[n]) break;
+        n++;
+        tok = strtok_r(NULL, " \t\n\r", &save);
     }
-    if (o < outsz - 1) out[o++] = '\'';
-    out[o] = '\0';
+    free(work);
+    argv[n] = NULL;
+    return n;
+}
+
+static void free_argv(char **argv, int n) {
+    for (int i = 0; i < n; i++) free(argv[i]);
+}
+
+static void spawn_detached_argv(char *const argv[]) {
+    if (!argv || !argv[0]) return;
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        pid_t pid2 = fork();
+        if (pid2 < 0) _exit(1);
+        if (pid2 > 0) _exit(0);
+        setsid();
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2) close(devnull);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    waitpid(pid, NULL, 0);
+}
+
+static int run_foreground(char *const argv[], const char *workdir) {
+    if (!argv || !argv[0]) return -1;
+    def_prog_mode(); endwin();
+    pid_t pid = fork();
+    if (pid < 0) { reset_prog_mode(); refresh(); return -1; }
+    if (pid == 0) {
+        if (workdir && *workdir && chdir(workdir) != 0) _exit(127);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    reset_prog_mode(); refresh();
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+    return -1;
+}
+
+static int get_mime_type(const char *path, char *out, size_t outsz) {
+    if (!path || !out || outsz < 2) return -1;
+    out[0] = '\0';
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        close(fds[0]);
+        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(127);
+        if (fds[1] > 2) close(fds[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        execlp("file", "file", "-b", "--mime-type", path, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    ssize_t total = 0;
+    while (total < (ssize_t)outsz - 1) {
+        ssize_t n = read(fds[0], out + total, outsz - 1 - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    close(fds[0]);
+    waitpid(pid, NULL, 0);
+    if (total <= 0) return -1;
+    out[total] = '\0';
+    while (total > 0 && (out[total - 1] == '\n' || out[total - 1] == '\r')) out[--total] = '\0';
+    return 0;
+}
+
+static int fs_delete_recursive(const char *path) {
+    if (!path || !*path) return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d) return -1;
+        struct dirent *de;
+        size_t plen = strlen(path);
+        int rc = 0;
+        while ((de = readdir(d))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            size_t nlen = strlen(de->d_name);
+            char *child = malloc(plen + 1 + nlen + 1);
+            if (!child) { rc = -1; break; }
+            memcpy(child, path, plen);
+            child[plen] = '/';
+            memcpy(child + plen + 1, de->d_name, nlen + 1);
+            if (fs_delete_recursive(child) != 0) rc = -1;
+            free(child);
+        }
+        closedir(d);
+        if (rc != 0) return -1;
+        return rmdir(path);
+    }
+    return unlink(path);
+}
+
+static void fs_delete(const char *target) {
+    fs_delete_recursive(target);
 }
 
 /* =========================================================================
- * СЕССИЯ И ИЗБРАННОЕ
+ * КОНФИГУРАЦИЯ
  * ========================================================================= */
+
+static void default_config(void) {
+    snprintf(g_theme.bg, 8, "#0000AA");
+    snprintf(g_theme.fg, 8, "#FFFFFF");
+    snprintf(g_theme.sel_bg, 8, "#00AAAA");
+    snprintf(g_theme.sel_fg, 8, "#FFFFFF");
+    snprintf(g_theme.sel_inactive_bg, 8, "#808080");
+    snprintf(g_theme.sel_inactive_fg, 8, "#00AAAA");
+    snprintf(g_theme.marked_bg, 8, "#000000");
+    snprintf(g_theme.marked_fg, 8, "#FFFF00");
+    snprintf(g_theme.dir, 8, "#FFFF55");
+    snprintf(g_theme.exec, 8, "#55FF55");
+    snprintf(g_theme.header_bg, 8, "#FFFFFF");
+    snprintf(g_theme.header_fg, 8, "#000000");
+    snprintf(g_theme.title_bg, 8, "#FFFFFF");
+    snprintf(g_theme.title_fg, 8, "#000000");
+    snprintf(g_theme.tab_active_bg, 8, "#55FF55");
+    snprintf(g_theme.tab_active_fg, 8, "#000000");
+    snprintf(g_theme.tab_inactive_bg, 8, "#000000");
+    snprintf(g_theme.tab_inactive_fg, 8, "#FFFFFF");
+    snprintf(g_theme.status_bg, 8, "#FFFFFF");
+    snprintf(g_theme.status_fg, 8, "#000000");
+    snprintf(g_theme.dialog_bg, 8, "#FFFFFF");
+    snprintf(g_theme.dialog_fg, 8, "#000000");
+}
+
+static void default_bindings(void) {
+    static const struct { const char *name; int key; } defs[] = {
+        {"open", '\n'}, {"open_l", 'l'},
+        {"menu", 'a'}, {"bookmarks", 'p'}, {"settings", 'o'},
+        {"help", 'i'}, {"split", 'm'}, {"preview", 'v'},
+        {"sort_next", 's'}, {"sort_reverse", 'S'},
+        {"select", ' '}, {"search", '/'},
+        {"refresh", 'r'}, {"refresh_full", 'R'},
+        {"quit", 'q'}, {"up", 'k'}, {"down", 'j'},
+        {"home", 'g'}, {"end", 'G'}, {"parent", 'h'},
+    };
+    g_app.binding_count = 0;
+    for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
+        copy_str(g_app.bindings[g_app.binding_count].name, 24, defs[i].name);
+        g_app.bindings[g_app.binding_count].key = defs[i].key;
+        g_app.binding_count++;
+    }
+}
+
+static int color_to_256(const char *hex) {
+    if (!hex || hex[0] != '#') return COLOR_WHITE;
+    if (strlen(hex) < 7) return COLOR_WHITE;
+    for (int i = 1; i < 7; i++) {
+        if (!isxdigit((unsigned char)hex[i])) return COLOR_WHITE;
+    }
+    int r = 0, g = 0, b = 0;
+    if (sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b) != 3) return COLOR_WHITE;
+    int cr = (r * 5 + 127) / 255;
+    int cg = (g * 5 + 127) / 255;
+    int cb = (b * 5 + 127) / 255;
+    return 16 + (36 * cr) + (6 * cg) + cb;
+}
+
+static char *theme_field_by_idx(int idx) {
+    switch (idx) {
+    case 0:  return g_theme.bg;
+    case 1:  return g_theme.fg;
+    case 2:  return g_theme.sel_bg;
+    case 3:  return g_theme.sel_fg;
+    case 4:  return g_theme.sel_inactive_bg;
+    case 5:  return g_theme.sel_inactive_fg;
+    case 6:  return g_theme.marked_bg;
+    case 7:  return g_theme.marked_fg;
+    case 8:  return g_theme.dir;
+    case 9:  return g_theme.exec;
+    case 10: return g_theme.header_bg;
+    case 11: return g_theme.header_fg;
+    case 12: return g_theme.title_bg;
+    case 13: return g_theme.title_fg;
+    case 14: return g_theme.tab_active_bg;
+    case 15: return g_theme.tab_active_fg;
+    case 16: return g_theme.tab_inactive_bg;
+    case 17: return g_theme.tab_inactive_fg;
+    case 18: return g_theme.status_bg;
+    case 19: return g_theme.status_fg;
+    case 20: return g_theme.dialog_bg;
+    case 21: return g_theme.dialog_fg;
+    }
+    return NULL;
+}
+
+static const char *theme_name_by_idx(int idx) {
+    static const char *names[THEME_FIELDS] = {
+        "bg", "fg", "sel_bg", "sel_fg", "sel_inactive_bg", "sel_inactive_fg",
+        "marked_bg", "marked_fg", "dir", "exec",
+        "header_bg", "header_fg", "title_bg", "title_fg",
+        "tab_active_bg", "tab_active_fg", "tab_inactive_bg", "tab_inactive_fg",
+        "status_bg", "status_fg", "dialog_bg", "dialog_fg"
+    };
+    if (idx < 0 || idx >= THEME_FIELDS) return "";
+    return names[idx];
+}
+
+static void load_config(void) {
+    default_config();
+    default_bindings();
+    g_theme_raw[0] = '\0';
+    g_new_theme_seen = 0;
+
+    char path[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home) return;
+    snprintf(path, sizeof path, "%s/.vibeyfilerc", home);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[PATH_MAX + 64];
+    int in_theme = 0, in_fav = 0, in_hist = 0, in_exec = 0, in_binds = 0;
+    int first_line = 1;
+
+    while (fgets(line, sizeof line, f)) {
+        char *start = line;
+        if (first_line) {
+            first_line = 0;
+            if ((unsigned char)start[0] == 0xEF && (unsigned char)start[1] == 0xBB && (unsigned char)start[2] == 0xBF) {
+                start += 3;
+            }
+        }
+        char *p = start;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (*p == '[') {
+            in_theme = !strncmp(p, "[THEME]", 7);
+            in_fav   = !strncmp(p, "[FAVORITE]", 10);
+            in_hist  = !strncmp(p, "[HISTORY]", 9);
+            in_exec  = !strncmp(p, "[EXECUTION]", 11);
+            in_binds = !strncmp(p, "[KEYBINDS]", 10);
+            if (in_theme) {
+                size_t add = strlen(start);
+                if (add > sizeof(g_theme_raw) - 1) add = sizeof(g_theme_raw) - 1;
+                memcpy(g_theme_raw, start, add);
+                g_theme_raw[add] = '\0';
+            }
+            continue;
+        }
+
+        if (in_theme) {
+            size_t cur = strlen(g_theme_raw);
+            size_t add = strlen(start);
+            if (cur + add + 1 < sizeof(g_theme_raw)) {
+                memcpy(g_theme_raw + cur, start, add);
+                g_theme_raw[cur + add] = '\0';
+            }
+        }
+
+        size_t len = strlen(start);
+        while (len > 0 && (start[len-1] == '\n' || start[len-1] == '\r')) start[--len] = '\0';
+        if (len == 0) continue;
+
+        if (in_theme) {
+            char *eq = strchr(start, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            char *key = start, *val = eq + 1;
+            while (*key == ' ' || *key == '\t') key++;
+            while (*val == ' ' || *val == '\t') val++;
+
+            char *kend = key + strlen(key);
+            while (kend > key && (kend[-1] == ' ' || kend[-1] == '\t')) {
+                *--kend = '\0';
+            }
+
+            if      (!strcmp(key, "bg"))               snprintf(g_theme.bg, 8, "%s", val);
+            else if (!strcmp(key, "fg"))               snprintf(g_theme.fg, 8, "%s", val);
+            else if (!strcmp(key, "sel_bg"))           snprintf(g_theme.sel_bg, 8, "%s", val);
+            else if (!strcmp(key, "sel_fg"))           snprintf(g_theme.sel_fg, 8, "%s", val);
+            else if (!strcmp(key, "sel_inactive_bg")) { snprintf(g_theme.sel_inactive_bg, 8, "%s", val); g_new_theme_seen |= NEW_FIELD_SEL_INACTIVE_BG; }
+            else if (!strcmp(key, "sel_inactive_fg")) { snprintf(g_theme.sel_inactive_fg, 8, "%s", val); g_new_theme_seen |= NEW_FIELD_SEL_INACTIVE_FG; }
+            else if (!strcmp(key, "marked_bg"))       { snprintf(g_theme.marked_bg, 8, "%s", val); g_new_theme_seen |= NEW_FIELD_MARKED_BG; }
+            else if (!strcmp(key, "marked_fg"))       { snprintf(g_theme.marked_fg, 8, "%s", val); g_new_theme_seen |= NEW_FIELD_MARKED_FG; }
+            else if (!strcmp(key, "dir"))              snprintf(g_theme.dir, 8, "%s", val);
+            else if (!strcmp(key, "exec"))             snprintf(g_theme.exec, 8, "%s", val);
+            else if (!strcmp(key, "header_bg"))        snprintf(g_theme.header_bg, 8, "%s", val);
+            else if (!strcmp(key, "header_fg"))        snprintf(g_theme.header_fg, 8, "%s", val);
+            else if (!strcmp(key, "title_bg"))         snprintf(g_theme.title_bg, 8, "%s", val);
+            else if (!strcmp(key, "title_fg"))         snprintf(g_theme.title_fg, 8, "%s", val);
+            else if (!strcmp(key, "tab_active_bg"))    snprintf(g_theme.tab_active_bg, 8, "%s", val);
+            else if (!strcmp(key, "tab_active_fg"))    snprintf(g_theme.tab_active_fg, 8, "%s", val);
+            else if (!strcmp(key, "tab_inactive_bg"))  snprintf(g_theme.tab_inactive_bg, 8, "%s", val);
+            else if (!strcmp(key, "tab_inactive_fg"))  snprintf(g_theme.tab_inactive_fg, 8, "%s", val);
+            else if (!strcmp(key, "status_bg"))        snprintf(g_theme.status_bg, 8, "%s", val);
+            else if (!strcmp(key, "status_fg"))        snprintf(g_theme.status_fg, 8, "%s", val);
+            else if (!strcmp(key, "dialog_bg"))        snprintf(g_theme.dialog_bg, 8, "%s", val);
+            else if (!strcmp(key, "dialog_fg"))        snprintf(g_theme.dialog_fg, 8, "%s", val);
+        } else if (in_fav) {
+            if (*start) add_bookmark(start);
+        } else if (in_exec) {
+            char *eq = strchr(start, '=');
+            if (eq) {
+                *eq = '\0';
+                char *key = start;
+                char *val = eq + 1;
+                while (*key == ' ' || *key == '\t') key++;
+                while (*val == ' ' || *val == '\t') val++;
+                char *kend = key + strlen(key);
+                while (kend > key && (kend[-1] == ' ' || kend[-1] == '\t')) {
+                    *--kend = '\0';
+                }
+                char *k = key;
+                while (*k == '.') k++;
+                if (*k && g_app.assoc_count < MAX_ASSOC) {
+                    copy_str(g_app.associations[g_app.assoc_count].ext, 32, k);
+                    copy_str(g_app.associations[g_app.assoc_count].cmd, PATH_MAX, val);
+                    g_app.assoc_count++;
+                }
+            }
+        } else if (in_binds) {
+            char *eq = strchr(start, '=');
+            if (eq) {
+                *eq = '\0';
+                char *key = start, *val = eq + 1;
+                while (*key == ' ' || *key == '\t') key++;
+                while (*val == ' ' || *val == '\t') val++;
+                char *kend = key + strlen(key);
+                while (kend > key && (kend[-1] == ' ' || kend[-1] == '\t')) *--kend = '\0';
+
+                int nk = 0;
+                if (val[0] == '\\' && val[1] == 'n') nk = '\n';
+                else if (val[0] == '\\' && val[1] == 't') nk = '\t';
+                else if (val[0] == '\\' && val[1] == 's') nk = ' ';
+                else if (val[0] == '\\' && val[1] == 'e') nk = 27;
+                else if ((unsigned char)val[0] >= 32 && (unsigned char)val[0] < 127) nk = (unsigned char)val[0];
+
+                if (nk) {
+                    for (int i = 0; i < g_app.binding_count; i++) {
+                        if (strcmp(g_app.bindings[i].name, key) == 0) {
+                            g_app.bindings[i].key = nk;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (in_hist) {
+            char *eq = strchr(start, '=');
+            if (eq) {
+                *eq = '\0';
+                char *key = start;
+                char *val = eq + 1;
+                while (*key == ' ' || *key == '\t') key++;
+                while (*val == ' ' || *val == '\t') val++;
+
+                char *kend = key + strlen(key);
+                while (kend > key && (kend[-1] == ' ' || kend[-1] == '\t')) {
+                    *--kend = '\0';
+                }
+
+                if (!strcmp(key, "active_tab")) {
+                    int idx = atoi(val);
+                    if (idx >= 0 && idx < NUM_TABS) g_app.active_tab = idx;
+                } else {
+                    int idx = -1;
+                    char suffix[32] = {0};
+                    if (sscanf(key, "tab%d_%31s", &idx, suffix) == 2) {
+                        if (idx >= 0 && idx < NUM_TABS) {
+                            if (!strcmp(suffix, "split")) g_app.tabs[idx].split_mode = atoi(val);
+                            else if (!strcmp(suffix, "preview")) g_app.tabs[idx].preview_mode = atoi(val);
+                            else if (!strcmp(suffix, "pane")) g_app.tabs[idx].active_pane = atoi(val);
+                            else if (!strcmp(suffix, "sel"))
+                                copy_str(g_app.tabs[idx].panes[0].pending_sel, MAX_NAME, val);
+                            else if (!strcmp(suffix, "p0_sel"))
+                                copy_str(g_app.tabs[idx].panes[0].pending_sel, MAX_NAME, val);
+                            else if (!strcmp(suffix, "p1_sel"))
+                                copy_str(g_app.tabs[idx].panes[1].pending_sel, MAX_NAME, val);
+                            else if (!strcmp(suffix, "p0"))
+                                copy_str(g_app.tabs[idx].panes[0].cwd, PATH_MAX, val);
+                            else if (!strcmp(suffix, "p1"))
+                                copy_str(g_app.tabs[idx].panes[1].cwd, PATH_MAX, val);
+                        }
+                    } else if (sscanf(key, "tab%d", &idx) == 1) {
+                        if (idx >= 0 && idx < NUM_TABS) {
+                            copy_str(g_app.tabs[idx].panes[0].cwd, PATH_MAX, val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fclose(f);
+
+    if (g_app.bookmark_count == 0) {
+        add_bookmark(home);
+        add_bookmark("/etc");
+        add_bookmark("/usr");
+        char cfg[PATH_MAX];
+        snprintf(cfg, sizeof cfg, "%s/.config", home);
+        add_bookmark(cfg);
+    }
+}
+
+static void save_config(void) {
+    char path[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home) return;
+    snprintf(path, sizeof path, "%s/.vibeyfilerc", home);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    if (g_theme_raw[0]) {
+        size_t len = strlen(g_theme_raw);
+        while (len > 0 && (g_theme_raw[len-1] == '\n' || g_theme_raw[len-1] == '\r')) {
+            g_theme_raw[--len] = '\0';
+        }
+        fputs(g_theme_raw, f);
+        fputc('\n', f);
+
+        if (!(g_new_theme_seen & NEW_FIELD_SEL_INACTIVE_BG)) fprintf(f, "sel_inactive_bg = %s\n", g_theme.sel_inactive_bg);
+        if (!(g_new_theme_seen & NEW_FIELD_SEL_INACTIVE_FG)) fprintf(f, "sel_inactive_fg = %s\n", g_theme.sel_inactive_fg);
+        if (!(g_new_theme_seen & NEW_FIELD_MARKED_BG))       fprintf(f, "marked_bg = %s\n", g_theme.marked_bg);
+        if (!(g_new_theme_seen & NEW_FIELD_MARKED_FG))       fprintf(f, "marked_fg = %s\n", g_theme.marked_fg);
+    } else {
+        fprintf(f, "[THEME]\n");
+        fprintf(f, "bg = %s\n", g_theme.bg);
+        fprintf(f, "fg = %s\n", g_theme.fg);
+        fprintf(f, "sel_bg = %s\n", g_theme.sel_bg);
+        fprintf(f, "sel_fg = %s\n", g_theme.sel_fg);
+        fprintf(f, "sel_inactive_bg = %s\n", g_theme.sel_inactive_bg);
+        fprintf(f, "sel_inactive_fg = %s\n", g_theme.sel_inactive_fg);
+        fprintf(f, "marked_bg = %s\n", g_theme.marked_bg);
+        fprintf(f, "marked_fg = %s\n", g_theme.marked_fg);
+        fprintf(f, "dir = %s\n", g_theme.dir);
+        fprintf(f, "exec = %s\n", g_theme.exec);
+        fprintf(f, "header_bg = %s\n", g_theme.header_bg);
+        fprintf(f, "header_fg = %s\n", g_theme.header_fg);
+        fprintf(f, "title_bg = %s\n", g_theme.title_bg);
+        fprintf(f, "title_fg = %s\n", g_theme.title_fg);
+        fprintf(f, "tab_active_bg = %s\n", g_theme.tab_active_bg);
+        fprintf(f, "tab_active_fg = %s\n", g_theme.tab_active_fg);
+        fprintf(f, "tab_inactive_bg = %s\n", g_theme.tab_inactive_bg);
+        fprintf(f, "tab_inactive_fg = %s\n", g_theme.tab_inactive_fg);
+        fprintf(f, "status_bg = %s\n", g_theme.status_bg);
+        fprintf(f, "status_fg = %s\n", g_theme.status_fg);
+        fprintf(f, "dialog_bg = %s\n", g_theme.dialog_bg);
+        fprintf(f, "dialog_fg = %s\n", g_theme.dialog_fg);
+    }
+
+    fprintf(f, "\n[FAVORITE]\n");
+    for (int i = 0; i < g_app.bookmark_count; i++) {
+        fprintf(f, "%s\n", g_app.bookmarks[i]);
+    }
+
+    fprintf(f, "\n[EXECUTION]\n");
+    for (int i = 0; i < g_app.assoc_count; i++) {
+        fprintf(f, ".%s = %s\n", g_app.associations[i].ext, g_app.associations[i].cmd);
+    }
+
+    fprintf(f, "\n[KEYBINDS]\n");
+    for (int i = 0; i < g_app.binding_count; i++) {
+        int k = g_app.bindings[i].key;
+        char kbuf[8];
+        if (k == '\n') snprintf(kbuf, sizeof kbuf, "\\n");
+        else if (k == '\t') snprintf(kbuf, sizeof kbuf, "\\t");
+        else if (k == ' ') snprintf(kbuf, sizeof kbuf, "\\s");
+        else if (k == 27) snprintf(kbuf, sizeof kbuf, "\\e");
+        else if (k >= 32 && k < 127) { kbuf[0] = (char)k; kbuf[1] = '\0'; }
+        else snprintf(kbuf, sizeof kbuf, "?");
+        fprintf(f, "%s = %s\n", g_app.bindings[i].name, kbuf);
+    }
+
+    fprintf(f, "\n[HISTORY]\n");
+    for (int i = 0; i < NUM_TABS; i++) {
+        FilePane *p0 = &g_app.tabs[i].panes[0];
+        FilePane *p1 = &g_app.tabs[i].panes[1];
+        if (p0->cwd[0]) {
+            fprintf(f, "tab%d = %s\n", i, p0->cwd);
+            if (p0->list.count > 0 && p0->file_sel > 0 && p0->file_sel < (int)p0->list.count) {
+                fprintf(f, "tab%d_sel = %s\n", i, p0->list.items[p0->file_sel].name);
+            }
+        }
+        if (p1->cwd[0]) {
+            fprintf(f, "tab%d_p1 = %s\n", i, p1->cwd);
+            if (p1->list.count > 0 && p1->file_sel > 0 && p1->file_sel < (int)p1->list.count) {
+                fprintf(f, "tab%d_p1_sel = %s\n", i, p1->list.items[p1->file_sel].name);
+            }
+        }
+        if (g_app.tabs[i].split_mode) {
+            fprintf(f, "tab%d_split = 1\n", i);
+        }
+        if (g_app.tabs[i].preview_mode) {
+            fprintf(f, "tab%d_preview = 1\n", i);
+        }
+        if (g_app.tabs[i].active_pane) {
+            fprintf(f, "tab%d_pane = 1\n", i);
+        }
+    }
+    fprintf(f, "active_tab = %d\n", g_app.active_tab);
+    fclose(f);
+}
 
 static void add_bookmark(const char *path) {
     if (!path || !*path) return;
@@ -309,114 +925,55 @@ static void add_bookmark(const char *path) {
     }
 }
 
-static void save_session(void) {
-    char path[PATH_MAX];
-    const char *home = getenv("HOME");
-    if (!home) return;
-    snprintf(path, sizeof path, "%s/.vibeyfile-h", home);
-    
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    
-    for (int i = 0; i < NUM_TABS; i++) {
-        if (g_app.tabs[i].panes[0].cwd[0])
-            fprintf(f, "TAB:%d:%s\n", i, g_app.tabs[i].panes[0].cwd);
-        if (g_app.tabs[i].split_mode && g_app.tabs[i].panes[1].cwd[0])
-            fprintf(f, "TAB2:%d:%s\n", i, g_app.tabs[i].panes[1].cwd);
-    }
-    for (int i = 0; i < g_app.bookmark_count; i++) {
-        fprintf(f, "BM:%s\n", g_app.bookmarks[i]);
-    }
-    fclose(f);
-}
-
-static void load_session(void) {
-    char path[PATH_MAX];
-    const char *home = getenv("HOME");
-    if (!home) return;
-    snprintf(path, sizeof path, "%s/.vibeyfile-h", home);
-    
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        add_bookmark(home);
-        add_bookmark("/etc");
-        add_bookmark("/usr");
-        char cfg[PATH_MAX];
-        snprintf(cfg, sizeof cfg, "%s/.config", home);
-        add_bookmark(cfg);
-        return;
-    }
-    
-    char line[PATH_MAX];
-    while (fgets(line, sizeof line, f)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
-        
-        if (strncmp(line, "TAB:", 4) == 0) {
-            int idx = atoi(line + 4);
-            char *cwd = strchr(line + 4, ':');
-            if (cwd && idx >= 0 && idx < NUM_TABS) {
-                copy_str(g_app.tabs[idx].panes[0].cwd, PATH_MAX, cwd + 1);
-            }
-        } else if (strncmp(line, "TAB2:", 5) == 0) {
-            int idx = atoi(line + 5);
-            char *cwd = strchr(line + 5, ':');
-            if (cwd && idx >= 0 && idx < NUM_TABS) {
-                copy_str(g_app.tabs[idx].panes[1].cwd, PATH_MAX, cwd + 1);
-                g_app.tabs[idx].split_mode = 1;
-            }
-        } else if (strncmp(line, "BM:", 3) == 0) {
-            add_bookmark(line + 3);
-        }
-    }
-    fclose(f);
-}
-
 /* =========================================================================
  * ФАЙЛОВАЯ СИСТЕМА
  * ========================================================================= */
 
-static int cmp_entry(const void *a, const void *b) {
+/* GNU qsort_r компаратор: (const void *, const void *, void *).
+ * Сигнатура строго соответствует glibc. */
+static int cmp_entry_ctx(const void *a, const void *b, void *ctx) {
     const Entry *ea = a, *eb = b;
+    const SortCtx *c = (const SortCtx *)ctx;
     if (ea->is_parent != eb->is_parent) return eb->is_parent - ea->is_parent;
     if (ea->is_dir != eb->is_dir) return eb->is_dir - ea->is_dir;
 
     int res = 0;
-    SortField field = CURRENT_TAB.panes[0].sort_field;
-    int desc = CURRENT_TAB.panes[0].sort_desc;
-    
-    if (field == SORT_NAME) {
+    if (c->field == SORT_NAME) {
         res = strcmp(ea->name, eb->name);
-    } else if (field == SORT_TYPE) {
+    } else if (c->field == SORT_TYPE) {
         const char *ta = type_str(ea->name, ea->is_dir, ea->mode);
         const char *tb = type_str(eb->name, eb->is_dir, eb->mode);
         res = strcmp(ta, tb);
         if (res == 0) res = strcmp(ea->name, eb->name);
-    } else if (field == SORT_DATE) {
+    } else if (c->field == SORT_DATE) {
         if (ea->mtime < eb->mtime) res = -1;
         else if (ea->mtime > eb->mtime) res = 1;
         else res = strcmp(ea->name, eb->name);
-    } else if (field == SORT_SIZE) {
+    } else if (c->field == SORT_SIZE) {
         if (ea->size < eb->size) res = -1;
         else if (ea->size > eb->size) res = 1;
         else res = strcmp(ea->name, eb->name);
     }
 
-    if (desc) res = -res;
+    if (c->desc) res = -res;
     return res;
 }
+
+/* Явный каст функции-компаратора: страховка на случай, если заголовок
+ * qsort_r где-то объявлен через несовместимый typedef и -Werror ругается
+ * 'incompatible pointer type'. На glibc каст тождественен. */
+typedef int (*GnuQsortRComparator)(const void *, const void *, void *);
 
 static void do_sort(FilePane *p) {
     char keep_name[MAX_NAME] = {0};
     if (p->list.count > 1 && p->file_sel > 0 && p->file_sel < (int)p->list.count) {
         copy_str(keep_name, sizeof keep_name, p->list.items[p->file_sel].name);
     }
-    
-    CURRENT_TAB.panes[0].sort_field = p->sort_field;
-    CURRENT_TAB.panes[0].sort_desc = p->sort_desc;
 
     if (p->list.count > 1) {
-        qsort(p->list.items + 1, p->list.count - 1, sizeof(*p->list.items), cmp_entry);
+        SortCtx ctx = { p->sort_field, p->sort_desc };
+        qsort_r(p->list.items + 1, p->list.count - 1, sizeof(*p->list.items),
+                (GnuQsortRComparator)cmp_entry_ctx, &ctx);
     }
 
     if (keep_name[0]) {
@@ -461,7 +1018,7 @@ static int load_dir(FilePane *p) {
             items = tmp; cap = ncap;
         }
         memset(&items[n], 0, sizeof(items[n]));
-        
+
         size_t dnl = strlen(de->d_name);
         if (dnl >= sizeof(items[n].name)) dnl = sizeof(items[n].name) - 1;
         memcpy(items[n].name, de->d_name, dnl);
@@ -486,11 +1043,13 @@ static int load_dir(FilePane *p) {
 
     if (p->file_sel >= (int)n) p->file_sel = n ? (int)n - 1 : 0;
     if (p->file_sel < 0)       p->file_sel = 0;
-    
-    CURRENT_TAB.panes[0].sort_field = p->sort_field;
-    CURRENT_TAB.panes[0].sort_desc = p->sort_desc;
-    if (n > 1) qsort(items + 1, n - 1, sizeof(*items), cmp_entry);
-    
+
+    if (n > 1) {
+        SortCtx ctx = { p->sort_field, p->sort_desc };
+        qsort_r(items + 1, n - 1, sizeof(*items),
+                (GnuQsortRComparator)cmp_entry_ctx, &ctx);
+    }
+
     return 0;
 }
 
@@ -503,33 +1062,48 @@ static int enter_dir(const char *path, FilePane *p) {
     return 0;
 }
 
-static off_t calc_size(const char *path) {
+static off_t calc_size(const char *path, int depth) {
+    if (depth > CALC_SIZE_MAX_DEPTH) return 0;
     struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    if (lstat(path, &st) != 0) return 0;
+    if (S_ISLNK(st.st_mode)) return 0;
     if (!S_ISDIR(st.st_mode)) return st.st_size;
     DIR *d = opendir(path);
     if (!d) return 0;
     struct dirent *de;
     off_t total = 0;
+    size_t plen = strlen(path);
     while ((de = readdir(d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        char child[PATH_MAX];
-        snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
-        total += calc_size(child);
+        size_t nlen = strlen(de->d_name);
+        char *child = malloc(plen + 1 + nlen + 1);
+        if (!child) continue;
+        memcpy(child, path, plen);
+        child[plen] = '/';
+        memcpy(child + plen + 1, de->d_name, nlen + 1);
+        total += calc_size(child, depth + 1);
+        free(child);
     }
     closedir(d);
     return total;
 }
 
-static void do_copy_file(const char *src, const char *dst, CopyProgress *cp) {
+static int do_copy_file(const char *src, const char *dst, CopyProgress *cp) {
     int in = open(src, O_RDONLY);
-    if (in < 0) return;
+    if (in < 0) return -1;
     int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out < 0) { close(in); return; }
+    if (out < 0) { close(in); return -1; }
     char buf[65536];
     ssize_t n;
     while ((n = read(in, buf, sizeof(buf))) > 0) {
-        if (write(out, buf, n) != n) break;
+        ssize_t written = 0;
+        while (written < n) {
+            ssize_t w = write(out, buf + written, n - written);
+            if (w < 0 || w == 0) {
+                close(in); close(out); unlink(dst); return -1;
+            }
+            written += w;
+        }
         cp->done += n;
         if (cp->total > 0) {
             int pct = (int)((cp->done * 100) / cp->total);
@@ -540,37 +1114,57 @@ static void do_copy_file(const char *src, const char *dst, CopyProgress *cp) {
             }
         }
     }
-    close(in);
-    close(out);
+    if (n < 0) { close(in); close(out); unlink(dst); return -1; }
+    close(in); close(out);
+    return 0;
 }
 
-static void do_copy_recursive(const char *src, const char *dst, CopyProgress *cp) {
+static int do_copy_recursive(const char *src, const char *dst, CopyProgress *cp) {
     struct stat st;
-    if (stat(src, &st) != 0) return;
+    if (lstat(src, &st) != 0) return -1;
+    if (S_ISLNK(st.st_mode)) {
+        char target[PATH_MAX];
+        ssize_t len = readlink(src, target, sizeof(target) - 1);
+        if (len < 0) return -1;
+        target[len] = '\0';
+        if (symlink(target, dst) != 0) return -1;
+        return 0;
+    }
     if (S_ISDIR(st.st_mode)) {
-        mkdir(dst, 0755);
+        if (mkdir(dst, 0755) != 0 && errno != EEXIST) return -1;
         DIR *d = opendir(src);
-        if (!d) return;
+        if (!d) return -1;
         struct dirent *de;
+        int rc = 0;
+        size_t plen = strlen(src);
         while ((de = readdir(d))) {
             if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-            char s_child[PATH_MAX], d_child[PATH_MAX];
-            snprintf(s_child, sizeof(s_child), "%s/%s", src, de->d_name);
-            snprintf(d_child, sizeof(d_child), "%s/%s", dst, de->d_name);
-            do_copy_recursive(s_child, d_child, cp);
+            size_t nlen = strlen(de->d_name);
+            char *s_child = malloc(plen + 1 + nlen + 1);
+            if (!s_child) { rc = -1; break; }
+            memcpy(s_child, src, plen);
+            s_child[plen] = '/';
+            memcpy(s_child + plen + 1, de->d_name, nlen + 1);
+
+            char d_child[PATH_MAX];
+            if (make_path(d_child, sizeof d_child, dst, de->d_name) != 0) {
+                free(s_child);
+                rc = -1;
+                break;
+            }
+            if (do_copy_recursive(s_child, d_child, cp) != 0) {
+                free(s_child);
+                rc = -1;
+                break;
+            }
+            free(s_child);
         }
         closedir(d);
-    } else {
-        do_copy_file(src, dst, cp);
+        return rc;
+    } else if (S_ISREG(st.st_mode)) {
+        return do_copy_file(src, dst, cp);
     }
-}
-
-static void fs_delete(const char *target) {
-    char qtarget[PATH_MAX * 2 + 8];
-    shell_quote(qtarget, sizeof qtarget, target);
-    char cmd[PATH_MAX * 3 + 32];
-    snprintf(cmd, sizeof cmd, "rm -rf -- %s", qtarget);
-    def_prog_mode(); endwin(); system(cmd); reset_prog_mode(); refresh();
+    return -1;
 }
 
 static int get_selected_or_current(FilePane *p, char paths[][PATH_MAX], int max_paths) {
@@ -594,48 +1188,61 @@ static void init_attributes(void) {
     if (has_colors()) {
         start_color();
         use_default_colors();
-        init_pair(PAIR_SEL_ACTIVE,   COLOR_WHITE, COLOR_BLUE);
-        init_pair(PAIR_SEL_INACTIVE, COLOR_BLACK, COLOR_CYAN);
-        init_pair(PAIR_HEADER,       COLOR_WHITE, COLOR_BLACK);
-        init_pair(PAIR_TITLE,        COLOR_WHITE, COLOR_BLUE);
-        init_pair(PAIR_TAB_ACTIVE,   COLOR_WHITE, COLOR_BLUE);
-        init_pair(PAIR_TAB_INACTIVE, COLOR_WHITE, COLOR_BLACK);
-        init_pair(PAIR_QUIT,         COLOR_WHITE, COLOR_RED);
-        init_pair(PAIR_QUIT_SEL,     COLOR_YELLOW, COLOR_RED);
-        init_pair(PAIR_GRAY_BG,      COLOR_BLACK, COLOR_WHITE);
-        init_pair(PAIR_MARKED,       COLOR_BLACK, COLOR_YELLOW);
-        init_pair(PAIR_BG,           COLOR_BLACK, COLOR_WHITE);
-        init_pair(PAIR_DIALOG,       COLOR_BLACK, COLOR_WHITE);
-        init_pair(PAIR_SHADOW,       COLOR_WHITE, COLOR_BLACK);
 
-        if (COLORS >= 256) {
-            init_pair(PAIR_ROW_EVEN, COLOR_BLACK, 255); // Bright white
-            init_pair(PAIR_ROW_ODD,  COLOR_BLACK, 254); // Light gray
-            init_pair(PAIR_DIR_EVEN, COLOR_BLUE,  255);
-            init_pair(PAIR_DIR_ODD,  COLOR_BLUE,  254);
-            init_pair(PAIR_EXEC_EVEN,COLOR_GREEN, 255);
-            init_pair(PAIR_EXEC_ODD, COLOR_GREEN, 254);
-        } else {
-            init_pair(PAIR_ROW_EVEN, COLOR_BLACK, COLOR_WHITE);
-            init_pair(PAIR_ROW_ODD,  COLOR_WHITE, COLOR_BLACK);
-            init_pair(PAIR_DIR_EVEN, COLOR_CYAN,  COLOR_WHITE);
-            init_pair(PAIR_DIR_ODD,  COLOR_CYAN,  COLOR_BLACK);
-            init_pair(PAIR_EXEC_EVEN,COLOR_GREEN, COLOR_WHITE);
-            init_pair(PAIR_EXEC_ODD, COLOR_GREEN, COLOR_BLACK);
-        }
+        int bg = color_to_256(g_theme.bg);
+        int fg = color_to_256(g_theme.fg);
+        int dir = color_to_256(g_theme.dir);
+        int exec = color_to_256(g_theme.exec);
+        int header_bg = color_to_256(g_theme.header_bg);
+        int header_fg = color_to_256(g_theme.header_fg);
+        int title_bg = color_to_256(g_theme.title_bg);
+        int title_fg = color_to_256(g_theme.title_fg);
+        int tab_active_bg = color_to_256(g_theme.tab_active_bg);
+        int tab_active_fg = color_to_256(g_theme.tab_active_fg);
+        int tab_inactive_bg = color_to_256(g_theme.tab_inactive_bg);
+        int tab_inactive_fg = color_to_256(g_theme.tab_inactive_fg);
+        int status_bg = color_to_256(g_theme.status_bg);
+        int status_fg = color_to_256(g_theme.status_fg);
+        int dialog_bg = color_to_256(g_theme.dialog_bg);
+        int dialog_fg = color_to_256(g_theme.dialog_fg);
 
-        A_PANEL        = A_NORMAL;
+        init_pair(PAIR_BG,           fg, bg);
+        init_pair(PAIR_SEL_ACTIVE,   color_to_256(g_theme.sel_fg), color_to_256(g_theme.sel_bg));
+        init_pair(PAIR_SEL_INACTIVE, color_to_256(g_theme.sel_inactive_fg), color_to_256(g_theme.sel_inactive_bg));
+        init_pair(PAIR_DIR,          dir, bg);
+        init_pair(PAIR_EXEC,         exec, bg);
+        init_pair(PAIR_HEADER,       header_fg, header_bg);
+        init_pair(PAIR_TITLE,        title_fg, title_bg);
+        init_pair(PAIR_TAB_ACTIVE,   tab_active_fg, tab_active_bg);
+        init_pair(PAIR_TAB_INACTIVE, tab_inactive_fg, tab_inactive_bg);
+        init_pair(PAIR_STATUS,       status_fg, status_bg);
+        init_pair(PAIR_DIALOG,       dialog_fg, dialog_bg);
+        init_pair(PAIR_SHADOW,       COLOR_BLACK, COLOR_BLACK);
+        init_pair(PAIR_MARKED,       color_to_256(g_theme.marked_fg), color_to_256(g_theme.marked_bg));
+        init_pair(PAIR_MENU_SEL,     color_to_256(g_theme.sel_fg), color_to_256(g_theme.sel_bg));
+        init_pair(PAIR_SCROLL,       color_to_256(g_theme.sel_fg), color_to_256(g_theme.sel_bg));
+
+        A_PANEL        = COLOR_PAIR(PAIR_BG);
         A_SEL_ACTIVE   = COLOR_PAIR(PAIR_SEL_ACTIVE) | A_BOLD;
         A_SEL_INACTIVE = COLOR_PAIR(PAIR_SEL_INACTIVE);
-        A_DIR          = A_BOLD;
-        A_EXEC         = A_BOLD;
-        A_HEADER_GRAY  = COLOR_PAIR(PAIR_GRAY_BG) | A_BOLD;
+        A_DIR          = COLOR_PAIR(PAIR_DIR) | A_BOLD;
+        A_EXEC         = COLOR_PAIR(PAIR_EXEC);
+        A_HEADER_GRAY  = COLOR_PAIR(PAIR_HEADER) | A_BOLD;
         A_TITLE        = COLOR_PAIR(PAIR_TITLE) | A_BOLD;
         A_TAB_ACTIVE   = COLOR_PAIR(PAIR_TAB_ACTIVE) | A_BOLD;
         A_TAB_INACTIVE = COLOR_PAIR(PAIR_TAB_INACTIVE);
         A_MARKED       = COLOR_PAIR(PAIR_MARKED) | A_BOLD;
         A_BUTTON       = A_NORMAL;
         A_BUTTON_SEL   = A_REVERSE | A_BOLD;
+        A_MENU_SEL     = COLOR_PAIR(PAIR_MENU_SEL) | A_BOLD;
+        A_MENU_NORMAL  = COLOR_PAIR(PAIR_DIALOG);
+        A_SCROLL_THUMB = COLOR_PAIR(PAIR_SCROLL) | A_BOLD;
+        A_SCROLL_TRACK = A_PANEL;
+    } else {
+        A_MENU_SEL = A_REVERSE | A_BOLD;
+        A_MENU_NORMAL = A_NORMAL;
+        A_SCROLL_THUMB = A_REVERSE;
+        A_SCROLL_TRACK = A_NORMAL;
     }
 }
 
@@ -670,6 +1277,7 @@ static int get_key(int raw_mode) {
                 case 0x80: return 'h'; case 0x88: return 'i'; case 0x82: return 'n';
                 case 0xA4: return 'A'; case 0xAB: return 'S'; case 0xAC: return 'M';
                 case 0xA8: return 'I'; case 0xA2: return 'N';
+                case 0x9E: return 'O';
             }
         }
         return 0;
@@ -677,80 +1285,451 @@ static int get_key(int raw_mode) {
     return ch;
 }
 
+/* =========================================================================
+ * ГЕОМЕТРИЯ ПАНЕЛИ (единая точка расчёта колонок)
+ * ========================================================================= */
+
+static void compute_geometry(int x, int w, int show_type, int show_date, int show_size, PaneGeom *g) {
+    int name_w = w - 6 - 1;
+    if (show_size) name_w -= (SIZE_W + 1);
+    if (show_date) name_w -= (DATE_W + 1);
+    if (show_type) name_w -= (TYPE_W + 1);
+    if (name_w < 4) name_w = 4;
+
+    g->show_type = show_type;
+    g->show_date = show_date;
+    g->show_size = show_size;
+    g->name_w = name_w;
+    g->x_name = x + 6;
+    g->x_type = show_type ? g->x_name + name_w + 1 : -1;
+    g->x_date = show_date ? (show_type ? g->x_type + TYPE_W + 1 : g->x_name + name_w + 1) : -1;
+    g->x_size = show_size ? x + w - SIZE_W : -1;
+}
+
 static void message_box(const char *title, const char *msg) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    int w = cols - 10;
-    if (w > 60) w = 60;
+
+    char *lines_buf = strdup(msg);
+    if (!lines_buf) return;
+
+    char **lines = NULL;
+    int line_count = 0, line_cap = 0;
+    char *saveptr = NULL;
+    char *line = strtok_r(lines_buf, "\n", &saveptr);
+    while (line) {
+        if (line_count == line_cap) {
+            int ncap = line_cap ? line_cap * 2 : 16;
+            char **tmp = realloc(lines, ncap * sizeof(char*));
+            if (!tmp) {
+                free(lines);
+                free(lines_buf);
+                return;
+            }
+            lines = tmp;
+            line_cap = ncap;
+        }
+        lines[line_count++] = line;
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    int max_chars = utf8_strlen(title);
+    for (int i = 0; i < line_count; i++) {
+        int l = utf8_strlen(lines[i]);
+        if (l > max_chars) max_chars = l;
+    }
+    int w = max_chars + 6;
+    if (w > cols - 4) w = cols - 4;
     if (w < 40) w = 40;
-    int h = 9;
+
+    int h = line_count + 4;
+    if (h > rows - 4) h = rows - 4;
+    if (h < 6) h = 6;
+
     int y = (rows - h) / 2, x = (cols - w) / 2;
-    
+
+    int vis = h - 4;
+    if (vis < 1) vis = 1;
+    int max_scroll = line_count - vis;
+    if (max_scroll < 0) max_scroll = 0;
+    int scroll = 0;
+
     apply_shadow(y, x, h, w);
     WINDOW *win = newwin(h, w, y, x);
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     keypad(win, TRUE);
-    box(win, 0, 0);
-    mvwaddnstr(win, 0, 2, title, w - 4);
-    
-    int line = 2;
-    const char *p = msg;
-    while (*p && line < h - 2) {
-        int len = 0;
-        while (p[len] && p[len] != '\n' && len < w - 4) len++;
-        mvwaddnstr(win, line, 2, p, len);
-        p += len;
-        if (*p == '\n') p++;
-        line++;
+
+    int running = 1;
+    while (running) {
+        werase(win);
+        box(win, 0, 0);
+        {
+            size_t tbytes = utf8_prefix_bytes(title, w - 4);
+            mvwaddnstr(win, 0, 2, title, tbytes);
+        }
+
+        for (int i = 0; i < vis && scroll + i < line_count; i++) {
+            const char *ln = lines[scroll + i];
+            size_t lbytes = utf8_prefix_bytes(ln, w - 4);
+            mvwaddnstr(win, 1 + i, 2, ln, lbytes);
+        }
+
+        if (max_scroll > 0) {
+            int bar_x = w - 2;
+            int bar_h = h - 3;
+            int thumb_h = (bar_h * vis) / line_count;
+            if (thumb_h < 1) thumb_h = 1;
+            int thumb_pos = (bar_h * scroll) / max_scroll;
+            if (thumb_pos + thumb_h > bar_h) thumb_pos = bar_h - thumb_h;
+            for (int i = 0; i < bar_h; i++) {
+                if (i >= thumb_pos && i < thumb_pos + thumb_h) {
+                    wattron(win, A_REVERSE);
+                    mvwaddch(win, 1 + i, bar_x, ' ');
+                    wattroff(win, A_REVERSE);
+                }
+            }
+        }
+
+        char footer[160];
+        if (max_scroll > 0) {
+            snprintf(footer, sizeof footer, "j/k, PgUp/PgDn - прокрутка | q/Esc/Enter - закрыть [%d/%d]",
+                     scroll + 1, max_scroll + 1);
+        } else {
+            snprintf(footer, sizeof footer, "Нажмите любую клавишу...");
+        }
+        {
+            size_t fbytes = utf8_prefix_bytes(footer, w - 4);
+            mvwaddnstr(win, h - 2, 2, footer, fbytes);
+        }
+        wrefresh(win);
+
+        int ch = wgetch(win);
+        if (ch == 'q' || ch == 'Q' || ch == 27 || ch == '\n' || ch == KEY_ENTER) {
+            running = 0;
+        } else if (ch == KEY_DOWN || ch == 'j') {
+            if (scroll < max_scroll) scroll++;
+        } else if (ch == KEY_UP || ch == 'k') {
+            if (scroll > 0) scroll--;
+        } else if (ch == KEY_NPAGE || ch == CTRL('d')) {
+            scroll += vis;
+            if (scroll > max_scroll) scroll = max_scroll;
+        } else if (ch == KEY_PPAGE || ch == CTRL('u')) {
+            scroll -= vis;
+            if (scroll < 0) scroll = 0;
+        } else if (ch == KEY_HOME) {
+            scroll = 0;
+        } else if (ch == KEY_END) {
+            scroll = max_scroll;
+        } else if (max_scroll == 0) {
+            running = 0;
+        }
     }
-    mvwaddnstr(win, h - 2, 2, "Нажмите любую клавишу...", w - 4);
-    wrefresh(win);
-    wgetch(win);
+
+    delwin(win);
+    free(lines);
+    free(lines_buf);
+    touchwin(stdscr);
+    refresh();
+}
+
+/* =========================================================================
+ * ВСТРОЕННЫЙ ПРОСМОТРЩИК
+ * ========================================================================= */
+
+static int is_text_file(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name) return 0;
+    dot++;
+    if (!strcasecmp(dot, "txt") || !strcasecmp(dot, "log") || !strcasecmp(dot, "md") || !strcasecmp(dot, "rst")) return 1;
+    if (!strcasecmp(dot, "c") || !strcasecmp(dot, "h") || !strcasecmp(dot, "cpp") || !strcasecmp(dot, "cc") ||
+        !strcasecmp(dot, "hpp") || !strcasecmp(dot, "py") || !strcasecmp(dot, "rs") || !strcasecmp(dot, "go") ||
+        !strcasecmp(dot, "js") || !strcasecmp(dot, "ts") || !strcasecmp(dot, "java") || !strcasecmp(dot, "rb")) return 1;
+    if (!strcasecmp(dot, "json") || !strcasecmp(dot, "yaml") || !strcasecmp(dot, "yml") ||
+        !strcasecmp(dot, "toml") || !strcasecmp(dot, "ini") || !strcasecmp(dot, "xml")) return 1;
+    if (!strcasecmp(dot, "sh") || !strcasecmp(dot, "bash") || !strcasecmp(dot, "zsh") || !strcasecmp(dot, "fish")) return 1;
+    return 0;
+}
+
+static int is_binary_content(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] == 0) return 1;
+    }
+    return 0;
+}
+
+static void view_file(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        message_box("Ошибка", "Не удалось открыть файл");
+        return;
+    }
+    if (st.st_size > VIEW_MAX_SIZE) {
+        message_box("Слишком большой файл", "Файл больше 5 МБ. Используйте внешний просмотрщик.");
+        return;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        message_box("Ошибка", "Не удалось открыть файл");
+        return;
+    }
+
+    char **lines = NULL;
+    int line_count = 0, line_cap = 0;
+    char *line = NULL;
+    size_t line_len = 0;
+    ssize_t n;
+
+    while ((n = getline(&line, &line_len, f)) != -1) {
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
+        if (line_count == line_cap) {
+            int ncap = line_cap ? line_cap * 2 : 256;
+            char **tmp = realloc(lines, ncap * sizeof(char*));
+            if (!tmp) {
+                free(line);
+                fclose(f);
+                for (int i = 0; i < line_count; i++) free(lines[i]);
+                free(lines);
+                message_box("Ошибка", "Недостаточно памяти для просмотра файла");
+                return;
+            }
+            lines = tmp;
+            line_cap = ncap;
+        }
+        /* OOM-safe: strdup в отдельную переменную; слот lines[line_count]
+         * не заполняется, пока копия не создана успешно. На OOM цикл
+         * очистки обходит только валидные [0, line_count). */
+        char *dup = strdup(line);
+        if (!dup) {
+            free(line);
+            fclose(f);
+            for (int i = 0; i < line_count; i++) free(lines[i]);
+            free(lines);
+            message_box("Ошибка", "Недостаточно памяти для просмотра файла");
+            return;
+        }
+        lines[line_count] = dup;
+        line_count++;
+    }
+    free(line);
+    fclose(f);
+
+    if (line_count == 0) {
+        free(lines);
+        message_box("Просмотр", "Файл пуст");
+        return;
+    }
+
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    WINDOW *win = newwin(rows, cols, 0, 0);
+    wbkgd(win, COLOR_PAIR(PAIR_BG));
+    keypad(win, TRUE);
+
+    int scroll = 0;
+    int vis = rows - 2;
+    int running = 1;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    while (running) {
+        werase(win);
+
+        wattron(win, A_TITLE);
+        mvwhline(win, 0, 0, ' ', cols);
+        char title[PATH_MAX + 32];
+        snprintf(title, sizeof title, " %s ", base);
+        mvwaddnstr(win, 0, 1, title, cols - 4);
+        wattroff(win, A_TITLE);
+
+        for (int i = 0; i < vis && scroll + i < line_count; i++) {
+            const char *ln = lines[scroll + i];
+            int safe_bytes = 0, chars = 0;
+            while (ln[safe_bytes] && chars < cols - 2) {
+                unsigned char ch = ln[safe_bytes];
+                int step = 1;
+                if ((ch & 0xE0) == 0xC0) step = 2;
+                else if ((ch & 0xF0) == 0xE0) step = 3;
+                else if ((ch & 0xF8) == 0xF0) step = 4;
+                if (safe_bytes + step > (int)strlen(ln)) break;
+                safe_bytes += step;
+                chars++;
+            }
+            mvwaddnstr(win, 1 + i, 1, ln, safe_bytes);
+        }
+
+        wattron(win, COLOR_PAIR(PAIR_STATUS));
+        mvwhline(win, rows - 1, 0, ' ', cols);
+        char status[512];
+        snprintf(status, sizeof status, " %s | %d/%d | q/Esc - выход", base, scroll + 1, line_count);
+        mvwaddnstr(win, rows - 1, 1, status, cols - 2);
+        wattroff(win, COLOR_PAIR(PAIR_STATUS));
+
+        wrefresh(win);
+
+        int ch = wgetch(win);
+        if (ch == 'q' || ch == 'Q' || ch == 27) {
+            running = 0;
+        } else if (ch == 'j' || ch == KEY_DOWN) {
+            if (scroll < line_count - 1) scroll++;
+        } else if (ch == 'k' || ch == KEY_UP) {
+            if (scroll > 0) scroll--;
+        } else if (ch == KEY_NPAGE || ch == CTRL('d')) {
+            scroll += vis;
+            if (scroll > line_count - vis) scroll = line_count - vis;
+            if (scroll < 0) scroll = 0;
+        } else if (ch == KEY_PPAGE || ch == CTRL('u')) {
+            scroll -= vis;
+            if (scroll < 0) scroll = 0;
+        } else if (ch == 'g' || ch == KEY_HOME) {
+            scroll = 0;
+        } else if (ch == 'G' || ch == KEY_END) {
+            scroll = line_count - vis;
+            if (scroll < 0) scroll = 0;
+        }
+    }
+
+    for (int i = 0; i < line_count; i++) free(lines[i]);
+    free(lines);
     delwin(win);
     touchwin(stdscr);
     refresh();
 }
 
 static void show_help(void) {
+    static const char *help_lines[] = {
+        " __     ___ _          _____ _ _      ",
+        " \\ \\   / (_) |__   ___|  ___(_) | ___ ",
+        "  \\ \\ / /| | '_ \\ / _ \\ |_  | | | |/ _ \\",
+        "   \\ V / | | |_) |  __/  _| | | | |  __/",
+        "    \\_/  |_|_.__/ \\___|_|   |_|_|_|\\___|",
+        "",
+        "Навигация:",
+        "  j/↓, k/↑     - Вверх / Вниз",
+        "  h/←          - Вверх по каталогам",
+        "  l/→/Enter    - Войти / Открыть (текст/код — встроенный просмотр)",
+        "  g / G        - В начало / В конец списка",
+        "  Tab          - Переключение панелей (в режиме сплита)",
+        "  Space        - Выделить / Снять выделение файла",
+        "",
+        "Действия и вкладки:",
+        "  a / [A]      - Открыть меню действий",
+        "  p / [=]      - Открыть избранное",
+        "  O / [O]      - Настройки (тема, бинды, ассоциации)",
+        "  m            - Вкл/выкл режим сплита",
+        "  v            - Вкл/выкл режим предпросмотра",
+        "  s / S        - Сортировка по колонкам / Реверс",
+        "  /            - Поиск по имени",
+        "  r            - Обновить список",
+        "  R            - Перерисовать экран + обновить",
+        "  F1..F4       - Переключение вкладок",
+        "  q / [X]      - Выход",
+        "  i            - Эта справка",
+        "",
+        "Клавиши можно переназначить в меню Настройки (O).",
+        "",
+        "Сотворено AINOnoko.",
+        "Свободно распространяется под лицензией GPLv3.",
+        NULL
+    };
+    int total = 0;
+    while (help_lines[total]) total++;
+
+    int max_len = 0;
+    for (int i = 0; i < total; i++) {
+        int len = utf8_strlen(help_lines[i]);
+        if (len > max_len) max_len = len;
+    }
+    if (max_len < 55) max_len = 55;
+
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    int w = 70, h = 24;
+    int w = max_len + 6;
     if (w > cols - 4) w = cols - 4;
+    if (w < 40) w = 40;
+
+    int h = (rows * 64) / 100;
     if (h > rows - 4) h = rows - 4;
+    if (h < 10) h = 10;
+
     int y = (rows - h) / 2, x = (cols - w) / 2;
+
+    int vis = h - 4;
+    if (vis < 1) vis = 1;
+    int max_scroll = total - vis;
+    if (max_scroll < 0) max_scroll = 0;
+    int scroll = 0;
 
     apply_shadow(y, x, h, w);
     WINDOW *win = newwin(h, w, y, x);
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     keypad(win, TRUE);
-    box(win, 0, 0);
-    mvwaddnstr(win, 0, 2, " Справка ", w - 4);
 
-    int cy = 2;
-    mvwprintw(win, cy++, 2, "Навигация:");
-    mvwprintw(win, cy++, 4, "j/↓, k/↑     - Вверх / Вниз");
-    mvwprintw(win, cy++, 4, "h/←          - Вверх по каталогам");
-    mvwprintw(win, cy++, 4, "l/→/Enter    - Войти в каталог / Открыть файл");
-    mvwprintw(win, cy++, 4, "g / G        - В начало / В конец списка");
-    mvwprintw(win, cy++, 4, "Tab          - Переключение панелей (в режиме сплита)");
-    mvwprintw(win, cy++, 4, "Space        - Выделить / Снять выделение файла");
+    int running = 1;
+    while (running) {
+        werase(win);
+        box(win, 0, 0);
+        mvwaddnstr(win, 0, 2, " Справка ", w - 4);
 
-    cy++;
-    mvwprintw(win, cy++, 2, "Действия и вкладки:");
-    mvwprintw(win, cy++, 4, "a            - Открыть меню действий");
-    mvwprintw(win, cy++, 4, "p            - Открыть избранное");
-    mvwprintw(win, cy++, 4, "m            - Вкл/выкл режим сплита");
-    mvwprintw(win, cy++, 4, "v            - Вкл/выкл режим предпросмотра");
-    mvwprintw(win, cy++, 4, "s / S        - Сортировка по колонкам / Реверс");
-    mvwprintw(win, cy++, 4, "/            - Поиск по имени");
-    mvwprintw(win, cy++, 4, "F1..F4       - Переключение вкладок");
-    mvwprintw(win, cy++, 4, "r            - Обновить список");
-    mvwprintw(win, cy++, 4, "q            - Выход");
-    mvwprintw(win, cy++, 4, "i            - Эта справка");
+        for (int i = 0; i < vis; i++) {
+            int idx = scroll + i;
+            if (idx >= total) break;
+            mvwprintw(win, 1 + i, 2, "%s", help_lines[idx]);
+        }
 
-    mvwaddnstr(win, h - 2, 2, "Нажмите любую клавишу для выхода...", w - 4);
-    wrefresh(win);
-    wgetch(win);
+        if (max_scroll > 0) {
+            int bar_x = w - 2;
+            int bar_h = h - 3;
+            int thumb_h = (bar_h * vis) / total;
+            if (thumb_h < 1) thumb_h = 1;
+            int thumb_pos = (bar_h * scroll) / max_scroll;
+            if (thumb_pos + thumb_h > bar_h) thumb_pos = bar_h - thumb_h;
+            for (int i = 0; i < bar_h; i++) {
+                int row = 1 + i;
+                if (i >= thumb_pos && i < thumb_pos + thumb_h) {
+                    wattron(win, A_REVERSE);
+                    mvwaddch(win, row, bar_x, ' ');
+                    wattroff(win, A_REVERSE);
+                }
+            }
+        }
+
+        char footer[128];
+        if (max_scroll > 0) {
+            snprintf(footer, sizeof footer, "j/k, PgUp/PgDn - прокрутка | q/Esc - выход [%d/%d]",
+                     scroll + 1, max_scroll + 1);
+        } else {
+            snprintf(footer, sizeof footer, "q/Esc - выход");
+        }
+        mvwaddnstr(win, h - 2, 2, footer, w - 4);
+        wrefresh(win);
+
+        int ch = wgetch(win);
+        if (ch == 'q' || ch == 'Q' || ch == 27 || ch == 'i' || ch == 'I' ||
+            ch == '\n' || ch == KEY_ENTER) {
+            running = 0;
+        } else if (ch == KEY_DOWN || ch == 'j') {
+            if (scroll < max_scroll) scroll++;
+        } else if (ch == KEY_UP || ch == 'k') {
+            if (scroll > 0) scroll--;
+        } else if (ch == KEY_NPAGE || ch == CTRL('d')) {
+            scroll += vis;
+            if (scroll > max_scroll) scroll = max_scroll;
+        } else if (ch == KEY_PPAGE || ch == CTRL('u')) {
+            scroll -= vis;
+            if (scroll < 0) scroll = 0;
+        } else if (ch == KEY_HOME || ch == 'g') {
+            scroll = 0;
+        } else if (ch == KEY_END || ch == 'G') {
+            scroll = max_scroll;
+        }
+    }
+
     delwin(win);
     touchwin(stdscr);
     refresh();
@@ -797,18 +1776,18 @@ static int dialog_input(const char *title, const char *prompt, char *out, size_t
     if (w < 40) w = 40;
     int h = 7;
     int y = (rows - h) / 2, x = (cols - w) / 2;
-    
+
     apply_shadow(y, x, h, w);
     WINDOW *win = newwin(h, w, y, x);
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     keypad(win, TRUE);
     box(win, 0, 0);
-    
+
     char buf[PATH_MAX];
     copy_str(buf, sizeof buf, out);
     int len = strlen(buf);
     int ch;
-    
+
     while (1) {
         werase(win);
         box(win, 0, 0);
@@ -817,7 +1796,7 @@ static int dialog_input(const char *title, const char *prompt, char *out, size_t
         mvwprintw(win, 3, 2, "%s", buf);
         wmove(win, 3, 2 + utf8_strlen(buf));
         wrefresh(win);
-        
+
         ch = wgetch(win);
         if (ch == '\n' || ch == KEY_ENTER) break;
         else if (ch == 27) { len = -1; break; }
@@ -841,11 +1820,11 @@ static int dialog_input(const char *title, const char *prompt, char *out, size_t
             }
         }
     }
-    
+
     delwin(win);
     touchwin(stdscr);
     refresh();
-    
+
     if (len >= 0) {
         copy_str(out, outsz, buf);
         return 1;
@@ -853,6 +1832,12 @@ static int dialog_input(const char *title, const char *prompt, char *out, size_t
     return 0;
 }
 
+/* Корректная обработка русской раскладки в UTF-8:
+ *   "д" U+0434 = 0xD0 0xB4   } Да (Yes)
+ *   "Д" U+0414 = 0xD0 0x94   }
+ *   "н" U+043D = 0xD0 0xBD   } Нет (No)
+ *   "Н" U+041D = 0xD0 0x9D   }
+ * Ранее код ошибочно трактовал 0xBD/0x9D ("н"/"Н") как "Да". */
 static int dialog_confirm(const char *title, const char *prompt) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -861,47 +1846,48 @@ static int dialog_confirm(const char *title, const char *prompt) {
     if (w < 40) w = 40;
     int h = 9;
     int y = (rows - h) / 2, x = (cols - w) / 2;
-    
+
     apply_shadow(y, x, h, w);
     WINDOW *win = newwin(h, w, y, x);
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     keypad(win, TRUE);
     box(win, 0, 0);
-    
+
     int btn_sel = 0;
     int res = 0;
     int running = 1;
     int ch;
     int btn_w = 10;
     int btn_x = (w - btn_w) / 2;
-    
+
     while (running) {
         werase(win);
         box(win, 0, 0);
         mvwaddnstr(win, 0, 2, title, w - 4);
         mvwaddnstr(win, 2, 2, prompt, w - 4);
-        
+
         int y_yes = 4;
         int attr_yes = (btn_sel == 0) ? A_BUTTON_SEL : A_BUTTON;
         wattron(win, attr_yes);
         mvwprintw(win, y_yes, btn_x, "[   Да   ]");
         wattroff(win, attr_yes);
-        
+
         int y_no = 6;
         int attr_no = (btn_sel == 1) ? A_BUTTON_SEL : A_BUTTON;
         wattron(win, attr_no);
         mvwprintw(win, y_no, btn_x, "[   Нет  ]");
         wattroff(win, attr_no);
-        
+
         wrefresh(win);
-        
+
         ch = wgetch(win);
-        if (ch == 'y' || ch == 'Y' || ch == 0xD0 || ch == 0xD1) {
-            if (ch == 'y' || ch == 'Y') { res = 1; running = 0; }
-            else if (ch == 0xD0) { int c2 = wgetch(win); if (c2 == 0xBD || c2 == 0x9D) { res = 1; running = 0; } }
-            else if (ch == 0xD1) { int c2 = wgetch(win); if (c2 == 0x82 || c2 == 0xA2) { res = 0; running = 0; } }
-        }
+        if (ch == 'y' || ch == 'Y') { res = 1; running = 0; }
         else if (ch == 'n' || ch == 'N' || ch == 27) { res = 0; running = 0; }
+        else if (ch == 0xD0) {
+            int c2 = wgetch(win);
+            if (c2 == 0xB4 || c2 == 0x94) { res = 1; running = 0; }     /* д/Д -> Да */
+            else if (c2 == 0xBD || c2 == 0x9D) { res = 0; running = 0; } /* н/Н -> Нет */
+        }
         else if (ch == KEY_UP || ch == KEY_DOWN) { btn_sel = 1 - btn_sel; }
         else if (ch == '\n' || ch == KEY_ENTER) { res = (btn_sel == 0) ? 1 : 0; running = 0; }
         else if (ch == KEY_MOUSE) {
@@ -914,7 +1900,7 @@ static int dialog_confirm(const char *title, const char *prompt) {
             }
         }
     }
-    
+
     delwin(win);
     touchwin(stdscr);
     refresh();
@@ -944,7 +1930,7 @@ static void draw_tabs(int rows, int cols) {
         int attr = (i == g_app.active_tab) ? A_TAB_ACTIVE : A_TAB_INACTIVE;
         attron(attr);
         mvhline(rows - 1, x, ' ', w);
-        
+
         int chars = 0, bytes = 0;
         while (line[bytes] && chars < w) {
             unsigned char c = line[bytes];
@@ -961,60 +1947,56 @@ static void draw_tabs(int rows, int cols) {
     }
 }
 
-static void draw_pane_header(FilePane *p, int x, int w, int show_type, int show_date, int show_size) {
-    int name_w = w - 6 - 1;
-    if (show_size) name_w -= (SIZE_W + 1);
-    if (show_date) name_w -= (DATE_W + 1);
-    if (show_type) name_w -= (TYPE_W + 1);
-    if (name_w < 4) name_w = 4;
+static void draw_pane_header(FilePane *p, int pane_idx, int x, int w,
+                             int show_type, int show_date, int show_size) {
+    PaneGeom g;
+    compute_geometry(x, w, show_type, show_date, show_size, &g);
 
-    int x_icon = x + 2;
-    int x_name = x + 6;
-    int x_type = show_type ? x_name + name_w + 1 : -1;
-    int x_date = show_date ? (show_type ? x_type + TYPE_W + 1 : x_name + name_w + 1) : -1;
-    int x_size = show_size ? x + w - SIZE_W : -1;
+    if (pane_idx >= 0 && pane_idx < 2) {
+        g_app.g_x_name[pane_idx] = g.x_name;
+        g_app.g_x_type[pane_idx] = g.x_type;
+        g_app.g_x_date[pane_idx] = g.x_date;
+        g_app.g_x_size[pane_idx] = g.x_size;
+    }
 
     attron(A_HEADER_GRAY);
     mvhline(1, x, ' ', w);
-    
-    char h_name[64], h_type[64], h_date[64], h_size[64];
-    const char *arrow = p->sort_desc ? "↓" : "↑";
-    snprintf(h_name, sizeof h_name, "Имя %s", (p->sort_field == SORT_NAME) ? arrow : " ");
-    snprintf(h_type, sizeof h_type, "Тип %s", (p->sort_field == SORT_TYPE) ? arrow : " ");
-    snprintf(h_date, sizeof h_date, "Изменён %s", (p->sort_field == SORT_DATE) ? arrow : " ");
-    snprintf(h_size, sizeof h_size, "Размер %s", (p->sort_field == SORT_SIZE) ? arrow : " ");
 
-    mvaddstr(1, x_icon, "[X]");
-    mvaddnstr(1, x_name, h_name, name_w);
-    if (show_type) mvaddnstr(1, x_type, h_type, TYPE_W);
-    if (show_date) mvaddnstr(1, x_date, h_date, DATE_W);
-    if (show_size) mvaddnstr(1, x_size, h_size, SIZE_W);
+    char h_name[64], h_type[64], h_date[64], h_size[64];
+    const char *arrow = p->sort_desc ? "▼" : "▲";
+    snprintf(h_name, sizeof h_name, "Имя %s",     (p->sort_field == SORT_NAME) ? arrow : " ");
+    snprintf(h_type, sizeof h_type, "Тип %s",     (p->sort_field == SORT_TYPE) ? arrow : " ");
+    snprintf(h_date, sizeof h_date, "Изменён %s", (p->sort_field == SORT_DATE) ? arrow : " ");
+    snprintf(h_size, sizeof h_size, "Размер %s",  (p->sort_field == SORT_SIZE) ? arrow : " ");
+
+    char name_padded[512], type_padded[64], date_padded[64], size_padded[64];
+    build_padded(name_padded, sizeof name_padded, h_name, g.name_w,  0);
+    build_padded(type_padded, sizeof type_padded, h_type, TYPE_W,  0);
+    build_padded(date_padded, sizeof date_padded, h_date, DATE_W,  0);
+    build_padded(size_padded, sizeof size_padded, h_size, SIZE_W,  0);
+
+    mvaddstr(1, x + 2, "[X]");
+    mvaddstr(1, g.x_name, name_padded);
+    if (g.show_type && g.x_type >= 0 && g.x_type < x + w) mvaddstr(1, g.x_type, type_padded);
+    if (g.show_date && g.x_date >= 0 && g.x_date < x + w) mvaddstr(1, g.x_date, date_padded);
+    if (g.show_size && g.x_size >= 0 && g.x_size < x + w) mvaddstr(1, g.x_size, size_padded);
     attroff(A_HEADER_GRAY);
 }
 
-static void draw_pane_row(FilePane *p, int x, int y, int w, int idx, int is_active, int show_type, int show_date, int show_size) {
+static void draw_pane_row(FilePane *p, int x, int y, int w, int idx, int is_active,
+                          int show_type, int show_date, int show_size) {
     Entry *e = &p->list.items[idx];
-    
-    int name_w = w - 6 - 1;
-    if (show_size) name_w -= (SIZE_W + 1);
-    if (show_date) name_w -= (DATE_W + 1);
-    if (show_type) name_w -= (TYPE_W + 1);
-    if (name_w < 4) name_w = 4;
+
+    PaneGeom g;
+    compute_geometry(x, w, show_type, show_date, show_size, &g);
 
     int attr;
-    if (idx == p->file_sel && is_active)     attr = A_SEL_ACTIVE;
+    if (idx == p->file_sel && is_active)       attr = A_SEL_ACTIVE;
     else if (idx == p->file_sel && !is_active) attr = A_SEL_INACTIVE;
-    else if (e->selected)                    attr = A_MARKED;
-    else {
-        int base_pair = (idx % 2 == 0) ? PAIR_ROW_EVEN : PAIR_ROW_ODD;
-        if (e->is_dir || e->is_parent)
-            base_pair = (idx % 2 == 0) ? PAIR_DIR_EVEN : PAIR_DIR_ODD;
-        else if (e->mode & (S_IXUSR | S_IXGRP | S_IXOTH))
-            base_pair = (idx % 2 == 0) ? PAIR_EXEC_EVEN : PAIR_EXEC_ODD;
-        
-        attr = COLOR_PAIR(base_pair);
-        if (e->is_dir || (e->mode & (S_IXUSR | S_IXGRP | S_IXOTH))) attr |= A_BOLD;
-    }
+    else if (e->selected)                      attr = A_MARKED;
+    else if (e->is_dir || e->is_parent)        attr = A_DIR;
+    else if (e->mode & (S_IXUSR | S_IXGRP | S_IXOTH)) attr = A_EXEC;
+    else                                       attr = A_PANEL;
 
     char date_str[16] = "-";
     char size_str[16] = "-";
@@ -1045,17 +2027,35 @@ static void draw_pane_row(FilePane *p, int x, int y, int w, int idx, int is_acti
 
     char name_padded[MAX_NAME * 4 + 32];
     char type_padded[64], date_padded[64], size_padded[64];
-    build_padded(name_padded, sizeof name_padded, name_disp,  name_w,  0);
+    build_padded(name_padded, sizeof name_padded, name_disp,  g.name_w,  0);
     build_padded(type_padded, sizeof type_padded, tname,       TYPE_W,  0);
     build_padded(date_padded, sizeof date_padded, date_str,    DATE_W,  0);
     build_padded(size_padded, sizeof size_padded, size_str,    SIZE_W,  1);
 
     char mark_char = (idx == p->file_sel) ? '>' : (e->selected ? '*' : ' ');
     char row[2048];
-    int pos = snprintf(row, sizeof row, "%c [%c] %s", mark_char, icon, name_padded);
-    if (show_type) pos += snprintf(row + pos, sizeof row - pos, " %s", type_padded);
-    if (show_date) pos += snprintf(row + pos, sizeof row - pos, " %s", date_padded);
-    if (show_size) pos += snprintf(row + pos, sizeof row - pos, " %s", size_padded);
+    int pos = 0;
+
+    #define ROW_APPEND(...) do { \
+        if ((size_t)pos < sizeof(row) - 1) { \
+            int _r = snprintf(row + pos, sizeof(row) - (size_t)pos, __VA_ARGS__); \
+            if (_r > 0 && (size_t)_r < sizeof(row) - (size_t)pos) { \
+                pos += _r; \
+            } else { \
+                pos = (int)sizeof(row) - 1; \
+                row[pos] = '\0'; \
+            } \
+        } \
+    } while (0)
+
+    ROW_APPEND("%c [%c] %s", mark_char, icon, name_padded);
+    if (g.show_type) ROW_APPEND(" %s", type_padded);
+    if (g.show_date) ROW_APPEND(" %s", date_padded);
+    if (g.show_size) ROW_APPEND(" %s", size_padded);
+    #undef ROW_APPEND
+
+    if (pos < (int)sizeof(row)) row[pos] = '\0';
+    else row[sizeof(row) - 1] = '\0';
 
     int safe_bytes = 0, chars = 0;
     while (row[safe_bytes] && chars < w) {
@@ -1075,20 +2075,27 @@ static void draw_pane_row(FilePane *p, int x, int y, int w, int idx, int is_acti
     attroff(attr);
 }
 
-static void draw_pane(FilePane *p, int x, int w, int is_active) {
+static void draw_pane(FilePane *p, int pane_idx, int x, int w, int is_active,
+                      int show_type, int show_date, int show_size) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     (void)cols;
 
-    int show_type = (w >= 40);
-    int show_date = (w >= 55);
-    int show_size = (w >= 28);
-
-    draw_pane_header(p, x, w, show_type, show_date, show_size);
-
     int items_y = 2;
-    int vis = rows - 3;
+    int vis = rows - 4;
     if (vis < 1) vis = 1;
+
+    int needs_scroll = ((int)p->list.count > vis);
+    int content_w = needs_scroll ? w - 1 : w;
+    if (content_w < 4) { content_w = w; needs_scroll = 0; }
+
+    draw_pane_header(p, pane_idx, x, content_w, show_type, show_date, show_size);
+
+    attron(A_PANEL);
+    for (int i = 0; i < vis; i++) {
+        mvhline(items_y + i, x, ' ', content_w);
+    }
+    attroff(A_PANEL);
 
     if (p->file_top < 0) p->file_top = 0;
     if (p->file_sel >= (int)p->list.count) p->file_sel = p->list.count ? (int)p->list.count - 1 : 0;
@@ -1099,18 +2106,50 @@ static void draw_pane(FilePane *p, int x, int w, int is_active) {
     for (int i = 0; i < vis; i++) {
         int idx = p->file_top + i;
         if (idx >= (int)p->list.count) break;
-        draw_pane_row(p, x, items_y + i, w, idx, is_active, show_type, show_date, show_size);
+        draw_pane_row(p, x, items_y + i, content_w, idx, is_active, show_type, show_date, show_size);
+    }
+
+    if (needs_scroll) {
+        int bar_x = x + w - 1;
+        int total = (int)p->list.count;
+        int thumb_h = (vis * vis) / total;
+        if (thumb_h < 1) thumb_h = 1;
+        if (thumb_h > vis) thumb_h = vis;
+        int max_scroll = total - vis;
+        int thumb_pos = max_scroll > 0 ? (vis - thumb_h) * p->file_top / max_scroll : 0;
+        if (thumb_pos + thumb_h > vis) thumb_pos = vis - thumb_h;
+        if (thumb_pos < 0) thumb_pos = 0;
+
+        for (int i = 0; i < vis; i++) {
+            if (i >= thumb_pos && i < thumb_pos + thumb_h) {
+                attron(A_SCROLL_THUMB);
+                mvaddch(items_y + i, bar_x, ' ');
+                attroff(A_SCROLL_THUMB);
+            } else {
+                attron(A_SCROLL_TRACK);
+                mvaddch(items_y + i, bar_x, ACS_VLINE);
+                attroff(A_SCROLL_TRACK);
+            }
+        }
     }
 }
 
 static void draw_preview(int x, int w, int rows) {
     FilePane *src = &CURRENT_TAB.panes[0];
     int idx = src->file_sel;
-    
+
     attron(A_HEADER_GRAY);
     mvhline(1, x, ' ', w);
     mvaddstr(1, x + 2, "Предпросмотр");
     attroff(A_HEADER_GRAY);
+
+    int vis = rows - 4;
+    if (vis < 1) vis = 1;
+    attron(A_PANEL);
+    for (int i = 0; i < vis; i++) {
+        mvhline(2 + i, x, ' ', w);
+    }
+    attroff(A_PANEL);
 
     if (idx < 0 || idx >= (int)src->list.count) return;
     Entry *e = &src->list.items[idx];
@@ -1128,9 +2167,9 @@ static void draw_preview(int x, int w, int rows) {
     if (!f) { mvaddstr(2, x + 2, "[Нет доступа]"); return; }
 
     int y = 2;
-    int max_lines = rows - 3;
+    int max_lines = rows - 4;
     char line_buf[1024];
-    
+
     int c, is_binary = 0;
     while ((c = fgetc(f)) != EOF && y < 2 + 20) {
         if (c == 0) { is_binary = 1; break; }
@@ -1148,7 +2187,7 @@ static void draw_preview(int x, int w, int rows) {
         while (len > 0 && (line_buf[len-1] == '\n' || line_buf[len-1] == '\r')) {
             line_buf[--len] = '\0';
         }
-        
+
         int safe_bytes = 0, chars = 0;
         while (line_buf[safe_bytes] && chars < w - 2) {
             unsigned char ch = line_buf[safe_bytes];
@@ -1166,34 +2205,136 @@ static void draw_preview(int x, int w, int rows) {
     fclose(f);
 }
 
+static void build_file_info(FilePane *p, char *out, size_t outsz) {
+    if (outsz == 0) return;
+    out[0] = '\0';
+    if (p->list.count == 0 || p->file_sel < 0 || p->file_sel >= (int)p->list.count) return;
+
+    Entry *e = &p->list.items[p->file_sel];
+    if (e->is_parent) {
+        snprintf(out, outsz, " ..  (родительский каталог)");
+        return;
+    }
+
+    char size_str[32];
+    if (e->is_dir) snprintf(size_str, sizeof size_str, "DIR");
+    else           format_size(size_str, sizeof size_str, e->size);
+
+    char date_str[32] = "?";
+    struct tm tmv, now_tm;
+    time_t now = time(NULL);
+    localtime_r(&now, &now_tm);
+    if (localtime_r(&e->mtime, &tmv)) {
+        if (tmv.tm_year == now_tm.tm_year)
+            strftime(date_str, sizeof date_str, "%m-%d %H:%M", &tmv);
+        else
+            strftime(date_str, sizeof date_str, "%Y-%m-%d ", &tmv);
+    }
+
+    char perm[16];
+    format_mode(perm, sizeof perm, e->mode);
+
+    snprintf(out, outsz, " %s  |  %s  |  %s  |  %s",
+             e->name, size_str, date_str, perm);
+}
+
 static void draw(void) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     erase();
 
-    attron(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
+    attron(A_TITLE);
     mvhline(0, 0, ' ', cols);
-    mvprintw(0, 1, " fm: %s | i: справка", ACTIVE_PANE.cwd);
-    mvprintw(0, cols - 4, "[X]");
-    attroff(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
+    mvprintw(0, 1, " fm: %s", ACTIVE_PANE.cwd);
+    mvprintw(0, cols - 16, "[A] [=] [O] [X]");
+    attroff(A_TITLE);
 
     if (CURRENT_TAB.split_mode) {
         int half = cols / 2;
-        draw_pane(&CURRENT_TAB.panes[0], 0, half, CURRENT_TAB.active_pane == 0);
+        int pw0 = half;
+        int pw1 = cols - half - 1;
+        draw_pane(&CURRENT_TAB.panes[0], 0, 0, pw0, CURRENT_TAB.active_pane == 0,
+                  pw0 >= COL_TYPE_MIN, pw0 >= COL_DATE_MIN, pw0 >= COL_SIZE_MIN);
         if (CURRENT_TAB.preview_mode) {
-            draw_preview(half + 1, cols - half - 1, rows);
+            draw_preview(half + 1, pw1, rows);
         } else {
-            draw_pane(&CURRENT_TAB.panes[1], half + 1, cols - half - 1, CURRENT_TAB.active_pane == 1);
+            draw_pane(&CURRENT_TAB.panes[1], 1, half + 1, pw1, CURRENT_TAB.active_pane == 1,
+                      pw1 >= COL_TYPE_MIN, pw1 >= COL_DATE_MIN, pw1 >= COL_SIZE_MIN);
         }
-        attron(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
-        for (int y = 1; y < rows - 1; y++) mvaddch(y, half, ACS_VLINE);
-        attroff(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
+        attron(A_TITLE);
+        for (int y = 1; y < rows - 2; y++) mvaddch(y, half, ACS_VLINE);
+        attroff(A_TITLE);
     } else {
-        draw_pane(&ACTIVE_PANE, 0, cols, 1);
+        draw_pane(&ACTIVE_PANE, CURRENT_TAB.active_pane, 0, cols, 1,
+                  cols >= COL_TYPE_MIN, cols >= COL_DATE_MIN, cols >= COL_SIZE_MIN);
     }
+
+    attron(COLOR_PAIR(PAIR_STATUS));
+    mvhline(rows - 2, 0, ' ', cols);
+    if (g_app.search_active) {
+        mvprintw(rows - 2, 1, "Поиск: %s", g_app.search_buf);
+        curs_set(1);
+        move(rows - 2, 8 + utf8_strlen(g_app.search_buf));
+    } else {
+        const char *left_text;
+        char file_info[1024];
+        if (g_app.last_action[0]) {
+            left_text = g_app.last_action;
+        } else {
+            build_file_info(&ACTIVE_PANE, file_info, sizeof file_info);
+            left_text = file_info;
+        }
+        int avail = cols - 18;
+        if (avail < 20) avail = 20;
+        if (avail > 1023) avail = 1023;
+        size_t bytes = utf8_prefix_bytes(left_text, avail);
+        mvaddnstr(rows - 2, 1, left_text, bytes);
+        mvprintw(rows - 2, cols - 15, "i: справка");
+        curs_set(0);
+    }
+    attroff(COLOR_PAIR(PAIR_STATUS));
 
     draw_tabs(rows, cols);
     refresh();
+}
+
+/* =========================================================================
+ * ЗАПУСК ФАЙЛА С УЧЁТОМ АССОЦИАЦИЙ (без shell)
+ * ========================================================================= */
+
+static void launch_path(const char *name, const char *full) {
+    char fullbuf[PATH_MAX];
+    copy_str(fullbuf, sizeof fullbuf, full);
+
+    const char *dot = strrchr(name, '.');
+    if (dot && dot != name && dot[1]) {
+        const char *ext = dot + 1;
+        for (int i = 0; i < g_app.assoc_count; i++) {
+            if (strcasecmp(g_app.associations[i].ext, ext) == 0) {
+                char *argv[MAX_ARGS];
+                int n = tokenize_cmd(g_app.associations[i].cmd, argv, MAX_ARGS);
+                if (n > 0 && n < MAX_ARGS - 1) {
+                    argv[n] = fullbuf;
+                    argv[n + 1] = NULL;
+                    spawn_detached_argv(argv);
+                    free_argv(argv, n);
+                    snprintf(g_app.last_action, sizeof g_app.last_action,
+                             "Открыто: %s (%s)", name, g_app.associations[i].cmd);
+                    return;
+                }
+                free_argv(argv, n);
+            }
+        }
+    }
+
+    if (is_text_file(name) && !is_binary_content(fullbuf)) {
+        view_file(fullbuf);
+        return;
+    }
+
+    char *xdg_argv[] = { "xdg-open", fullbuf, NULL };
+    spawn_detached_argv(xdg_argv);
+    snprintf(g_app.last_action, sizeof g_app.last_action, "Открыто: %s", name);
 }
 
 /* =========================================================================
@@ -1231,28 +2372,36 @@ static void action_open(FilePane *p) {
         return;
     }
 
-    char qname[PATH_MAX * 2 + 8];
-    shell_quote(qname, sizeof qname, e->name);
-    char cmd[PATH_MAX * 3 + 64];
-    snprintf(cmd, sizeof cmd, "xdg-open %s", qname);
-    def_prog_mode(); endwin(); system(cmd); reset_prog_mode(); refresh();
+    char full[PATH_MAX];
+    if (make_path(full, sizeof full, p->cwd, e->name) != 0) {
+        message_box("Ошибка", "Путь слишком длинный");
+        return;
+    }
+
+    launch_path(e->name, full);
 }
 
 static void action_open_as(FilePane *p) {
     if (p->list.count == 0 || p->file_sel == 0) { message_box("Внимание", "Ничего не выбрано"); return; }
     Entry *e = &p->list.items[p->file_sel];
     if (e->is_parent) { message_box("Ошибка", "Нельзя открыть .."); return; }
-    
+
     char cmd_buf[256];
     snprintf(cmd_buf, sizeof cmd_buf, "xdg-open");
-    if (dialog_input("Открыть как", "Команда:", cmd_buf, sizeof cmd_buf)) {
+    if (dialog_input("Открыть как", "Команда (без shell):", cmd_buf, sizeof cmd_buf)) {
         char target[PATH_MAX];
         if (make_path(target, sizeof target, p->cwd, e->name) == 0) {
-            char qname[PATH_MAX * 2 + 8];
-            shell_quote(qname, sizeof qname, target);
-            char cmd[PATH_MAX * 3 + 64];
-            snprintf(cmd, sizeof cmd, "%s %s", cmd_buf, qname);
-            def_prog_mode(); endwin(); system(cmd); reset_prog_mode(); refresh();
+            char *argv[MAX_ARGS];
+            int n = tokenize_cmd(cmd_buf, argv, MAX_ARGS);
+            if (n > 0 && n < MAX_ARGS - 1) {
+                argv[n] = target;
+                argv[n + 1] = NULL;
+                spawn_detached_argv(argv);
+                free_argv(argv, n);
+            } else {
+                free_argv(argv, n);
+                message_box("Ошибка", "Некорректная команда");
+            }
         }
     }
 }
@@ -1265,7 +2414,7 @@ static void action_edit(FilePane *p) {
     const char *editors[] = {"nvim", "vim", "vi", "nano"};
     const char *ed = NULL;
     const char *env_ed = getenv("EDITOR");
-    
+
     if (env_ed && *env_ed) {
         ed = env_ed;
     } else {
@@ -1273,26 +2422,37 @@ static void action_edit(FilePane *p) {
             const char *path = getenv("PATH");
             if (!path) break;
             char *path_copy = strdup(path);
-            char *dir = strtok(path_copy, ":");
+            if (!path_copy) break;
+            char *save = NULL;
+            char *dir = strtok_r(path_copy, ":", &save);
             char full[PATH_MAX];
             while (dir) {
                 snprintf(full, sizeof full, "%s/%s", dir, editors[i]);
                 if (access(full, X_OK) == 0) { ed = editors[i]; break; }
-                dir = strtok(NULL, ":");
+                dir = strtok_r(NULL, ":", &save);
             }
             free(path_copy);
             if (ed) break;
         }
     }
-    
+
     if (!ed) { message_box("Ошибка", "Редактор не найден"); return; }
 
-    char qname[PATH_MAX * 2 + 8];
-    shell_quote(qname, sizeof qname, e->name);
-    char cmd[PATH_MAX * 3 + 64];
-    snprintf(cmd, sizeof cmd, "%s %s", ed, qname);
-    def_prog_mode(); endwin(); system(cmd); reset_prog_mode(); refresh();
-    
+    char full[PATH_MAX];
+    if (make_path(full, sizeof full, p->cwd, e->name) != 0) {
+        message_box("Ошибка", "Путь слишком длинный");
+        return;
+    }
+
+    char edbuf[PATH_MAX];
+    copy_str(edbuf, sizeof edbuf, ed);
+
+    char *argv[3];
+    argv[0] = edbuf;
+    argv[1] = full;
+    argv[2] = NULL;
+    run_foreground(argv, NULL);
+
     load_dir(p);
 }
 
@@ -1305,8 +2465,12 @@ static void action_mkdir(FilePane *p) {
     if (dialog_input("Создать папку", "Имя папки:", name, sizeof name)) {
         char target[PATH_MAX];
         if (make_path(target, sizeof target, p->cwd, name) == 0) {
-            if (mkdir(target, 0755) == 0) { message_box("Успех", "Папка создана"); load_dir(p); }
-            else { message_box("Ошибка", "Не удалось создать папку"); }
+            if (mkdir(target, 0755) == 0) {
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Создана папка: %s", name);
+                load_dir(p);
+            } else {
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Ошибка: не удалось создать папку");
+            }
         }
     }
 }
@@ -1317,8 +2481,13 @@ static void action_touch(FilePane *p) {
         char target[PATH_MAX];
         if (make_path(target, sizeof target, p->cwd, name) == 0) {
             FILE *f = fopen(target, "w");
-            if (f) { fclose(f); message_box("Успех", "Файл создан"); load_dir(p); }
-            else { message_box("Ошибка", "Не удалось создать файл"); }
+            if (f) {
+                fclose(f);
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Создан файл: %s", name);
+                load_dir(p);
+            } else {
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Ошибка: не удалось создать файл");
+            }
         }
     }
 }
@@ -1327,13 +2496,13 @@ static void action_template(FilePane *p) {
     const char *templates[] = {"Пустой txt", "Python (.py)", "C (.c)", "Shell (.sh)"};
     int sel = run_submenu("Шаблоны", templates, 4);
     if (sel < 0) return;
-    
+
     char name[MAX_NAME];
     if (sel == 0) copy_str(name, sizeof name, "новый.txt");
     else if (sel == 1) copy_str(name, sizeof name, "новый.py");
     else if (sel == 2) copy_str(name, sizeof name, "новый.c");
     else copy_str(name, sizeof name, "новый.sh");
-    
+
     if (dialog_input("Создать из шаблона", "Имя файла:", name, sizeof name)) {
         char target[PATH_MAX];
         if (make_path(target, sizeof target, p->cwd, name) == 0) {
@@ -1344,9 +2513,11 @@ static void action_template(FilePane *p) {
                 else if (sel == 3) fprintf(f, "#!/bin/bash\n\necho \"Hello\"\n");
                 fclose(f);
                 if (sel == 3) chmod(target, 0755);
-                message_box("Успех", "Файл создан из шаблона");
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Создан из шаблона: %s", name);
                 load_dir(p);
-            } else { message_box("Ошибка", "Не удалось создать"); }
+            } else {
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Ошибка создания шаблона");
+            }
         }
     }
 }
@@ -1371,24 +2542,41 @@ static void action_archive(FilePane *p) {
 
     if (!dialog_input("Архивация", "Имя архива:", archname, sizeof archname)) return;
 
-    char qarch[PATH_MAX * 2 + 8];
-    shell_quote(qarch, sizeof qarch, archname);
-
-    char cmd[PATH_MAX * 5 + 64];
-    if (fmt == 0) snprintf(cmd, sizeof cmd, "zip -r %s", qarch);
-    else if (fmt == 1) snprintf(cmd, sizeof cmd, "tar -czf %s", qarch);
-    else snprintf(cmd, sizeof cmd, "tar -cJf %s", qarch);
-
-    for (int i = 0; i < count; i++) {
-        const char *base = strrchr(paths[i], '/');
-        char qbase[PATH_MAX * 2 + 8];
-        shell_quote(qbase, sizeof qbase, base ? base + 1 : paths[i]);
-        snprintf(cmd + strlen(cmd), sizeof cmd - strlen(cmd), " %s", qbase);
+    char *argv[MAX_ARGS];
+    int ai = 0;
+    char full_arch[PATH_MAX];
+    if (make_path(full_arch, sizeof full_arch, p->cwd, archname) != 0) {
+        message_box("Ошибка", "Путь слишком длинный");
+        return;
     }
-    
-    int rc = system(cmd);
-    if (rc == 0) { load_dir(p); message_box("Успех", "Архив создан"); }
-    else { message_box("Ошибка", "Сбой архивации"); }
+
+    if (fmt == 0) {
+        argv[ai++] = "zip";
+        argv[ai++] = "-r";
+        argv[ai++] = full_arch;
+    } else if (fmt == 1) {
+        argv[ai++] = "tar";
+        argv[ai++] = "-czf";
+        argv[ai++] = full_arch;
+    } else {
+        argv[ai++] = "tar";
+        argv[ai++] = "-cJf";
+        argv[ai++] = full_arch;
+    }
+    for (int i = 0; i < count && ai < MAX_ARGS - 1; i++) {
+        char *base = strrchr(paths[i], '/');
+        argv[ai++] = base ? base + 1 : paths[i];
+    }
+    argv[ai] = NULL;
+
+    int rc = run_foreground(argv, p->cwd);
+
+    if (rc == 0) {
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Создан архив: %s", archname);
+        load_dir(p);
+    } else {
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Ошибка архивации");
+    }
 }
 
 static void action_unarchive(FilePane *p) {
@@ -1397,64 +2585,120 @@ static void action_unarchive(FilePane *p) {
     const char *dot = strrchr(e->name, '.');
     if (!dot || e->is_dir) { message_box("Ошибка", "Не архив"); return; }
 
-    char qname[PATH_MAX * 2 + 8];
-    shell_quote(qname, sizeof qname, e->name);
-    char cmd[PATH_MAX * 3 + 64];
-    
-    if (!strcasecmp(dot, ".zip")) snprintf(cmd, sizeof cmd, "unzip -o %s", qname);
-    else if (!strcasecmp(dot, ".gz")) snprintf(cmd, sizeof cmd, "tar -xzf %s", qname);
-    else if (!strcasecmp(dot, ".xz")) snprintf(cmd, sizeof cmd, "tar -xJf %s", qname);
-    else if (!strcasecmp(dot, ".bz2")) snprintf(cmd, sizeof cmd, "tar -xjf %s", qname);
-    else if (!strcasecmp(dot, ".tar")) snprintf(cmd, sizeof cmd, "tar -xf %s", qname);
-    else { message_box("Ошибка", "Неизвестный формат"); return; }
+    char full[PATH_MAX];
+    if (make_path(full, sizeof full, p->cwd, e->name) != 0) {
+        message_box("Ошибка", "Путь слишком длинный");
+        return;
+    }
 
-    int rc = system(cmd);
-    if (rc == 0) { load_dir(p); message_box("Успех", "Разархивировано"); }
-    else { message_box("Ошибка", "Сбой разархивации"); }
+    char *argv[8];
+    int ai = 0;
+    if (!strcasecmp(dot, ".zip")) {
+        argv[ai++] = "unzip";
+        argv[ai++] = "-o";
+        argv[ai++] = full;
+    } else if (!strcasecmp(dot, ".gz")) {
+        argv[ai++] = "tar"; argv[ai++] = "-xzf"; argv[ai++] = full;
+    } else if (!strcasecmp(dot, ".xz")) {
+        argv[ai++] = "tar"; argv[ai++] = "-xJf"; argv[ai++] = full;
+    } else if (!strcasecmp(dot, ".bz2")) {
+        argv[ai++] = "tar"; argv[ai++] = "-xjf"; argv[ai++] = full;
+    } else if (!strcasecmp(dot, ".tar")) {
+        argv[ai++] = "tar"; argv[ai++] = "-xf"; argv[ai++] = full;
+    } else {
+        message_box("Ошибка", "Неизвестный формат");
+        return;
+    }
+    argv[ai] = NULL;
+
+    int rc = run_foreground(argv, p->cwd);
+
+    if (rc == 0) {
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Разархивировано: %s", e->name);
+        load_dir(p);
+    } else {
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Ошибка разархивации");
+    }
 }
 
 static void action_copy(FilePane *p) {
     g_app.clip_count = get_selected_or_current(p, g_app.clip_paths, MAX_CLIP);
     if (g_app.clip_count > 0) {
         g_app.clip_is_cut = 0;
-        message_box("Буфер обмена", "Скопировано");
-    } else message_box("Внимание", "Нечего копировать");
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Скопировано файлов: %d", g_app.clip_count);
+    } else {
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Нечего копировать");
+    }
 }
 
 static void action_cut(FilePane *p) {
     g_app.clip_count = get_selected_or_current(p, g_app.clip_paths, MAX_CLIP);
     if (g_app.clip_count > 0) {
         g_app.clip_is_cut = 1;
-        message_box("Буфер обмена", "Вырезано");
-    } else message_box("Внимание", "Нечего вырезать");
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Вырезано файлов: %d", g_app.clip_count);
+    } else {
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Нечего вырезать");
+    }
 }
 
 static void action_paste(FilePane *p) {
     if (g_app.clip_count == 0) { message_box("Внимание", "Буфер пуст"); return; }
-    
+
+    int processed = 0;
+    int failed = 0;
+
     for (int i = 0; i < g_app.clip_count; i++) {
         const char *base = strrchr(g_app.clip_paths[i], '/');
         base = base ? base + 1 : g_app.clip_paths[i];
         char dst[PATH_MAX], new_dst[PATH_MAX];
-        
-        if (make_path(dst, sizeof dst, p->cwd, base) == 0) {
-            if (strcmp(g_app.clip_paths[i], dst) == 0 || access(dst, F_OK) == 0) {
-                char new_name[MAX_NAME];
-                snprintf(new_name, sizeof new_name, "%s_copy", base);
-                make_path(new_dst, sizeof new_dst, p->cwd, new_name);
-            } else copy_str(new_dst, sizeof new_dst, dst);
 
-            if (g_app.clip_is_cut && rename(g_app.clip_paths[i], new_dst) == 0) continue;
+        if (make_path(dst, sizeof dst, p->cwd, base) != 0) { failed = 1; break; }
 
-            off_t total = calc_size(g_app.clip_paths[i]);
-            CopyProgress cp = {total, 0, progress_init(), base, -1};
-            show_progress(0, cp.disp, cp.win);
-            do_copy_recursive(g_app.clip_paths[i], new_dst, &cp);
-            delwin(cp.win);
-            if (g_app.clip_is_cut) fs_delete(g_app.clip_paths[i]);
+        if (strcmp(g_app.clip_paths[i], dst) == 0 || access(dst, F_OK) == 0) {
+            char new_name[MAX_NAME];
+            snprintf(new_name, sizeof new_name, "%s_copy", base);
+            if (make_path(new_dst, sizeof new_dst, p->cwd, new_name) != 0) { failed = 1; break; }
+        } else {
+            copy_str(new_dst, sizeof new_dst, dst);
         }
+
+        if (g_app.clip_is_cut && rename(g_app.clip_paths[i], new_dst) == 0) {
+            processed = i + 1;
+            continue;
+        }
+
+        off_t total = calc_size(g_app.clip_paths[i], 0);
+        CopyProgress cp = {total, 0, progress_init(), base, -1};
+        show_progress(0, cp.disp, cp.win);
+        int rc = do_copy_recursive(g_app.clip_paths[i], new_dst, &cp);
+        delwin(cp.win);
+        touchwin(stdscr);
+        refresh();
+
+        if (rc != 0) {
+            fs_delete(new_dst);
+            snprintf(g_app.last_action, sizeof g_app.last_action, "Ошибка копирования: %s", base);
+            message_box("Ошибка", "Не удалось скопировать файл. Частичная копия удалена, исходник сохранён.");
+            failed = 1;
+            break;
+        }
+
+        if (g_app.clip_is_cut) fs_delete(g_app.clip_paths[i]);
+        processed = i + 1;
     }
-    if (g_app.clip_is_cut) g_app.clip_count = 0;
+
+    if (g_app.clip_is_cut && processed > 0) {
+        int remaining = g_app.clip_count - processed;
+        for (int k = 0; k < remaining; k++) {
+            copy_str(g_app.clip_paths[k], PATH_MAX, g_app.clip_paths[processed + k]);
+        }
+        g_app.clip_count = remaining;
+        if (g_app.clip_count == 0) g_app.clip_is_cut = 0;
+    }
+
+    if (!failed) {
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Вставлено файлов: %d", processed);
+    }
     load_dir(p);
     touchwin(stdscr);
     refresh();
@@ -1464,7 +2708,7 @@ static void action_delete(FilePane *p) {
     char paths[MAX_CLIP][PATH_MAX];
     int count = get_selected_or_current(p, paths, MAX_CLIP);
     if (count == 0) return;
-    
+
     char msg[512];
     if (count == 1) {
         const char *base = strrchr(paths[0], '/');
@@ -1473,33 +2717,167 @@ static void action_delete(FilePane *p) {
 
     if (dialog_confirm("Удаление", msg)) {
         for (int i = 0; i < count; i++) fs_delete(paths[i]);
+        snprintf(g_app.last_action, sizeof g_app.last_action, "Удалено объектов: %d", count);
         load_dir(p);
-        message_box("Успех", "Удалено");
     }
 }
 
 static void action_rename(FilePane *p) {
     if (p->list.count == 0 || p->file_sel == 0) return;
     Entry *e = &p->list.items[p->file_sel];
-    
+
     char new_name[MAX_NAME];
     copy_str(new_name, sizeof new_name, e->name);
-    
+
     if (dialog_input("Переименование", "Новое имя:", new_name, sizeof new_name)) {
         char src[PATH_MAX], dst[PATH_MAX];
         if (make_path(src, sizeof src, p->cwd, e->name) == 0 && make_path(dst, sizeof dst, p->cwd, new_name) == 0) {
-            if (rename(src, dst) == 0) { load_dir(p); message_box("Успех", "Готово"); }
-            else message_box("Ошибка", "Сбой переименования");
+            if (rename(src, dst) == 0) {
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Переименовано: %s -> %s", e->name, new_name);
+                load_dir(p);
+            } else {
+                snprintf(g_app.last_action, sizeof g_app.last_action, "Ошибка переименования");
+            }
         }
     }
 }
 
 static void action_pin(FilePane *p) {
-    if (p->cwd[0]) {
-        add_bookmark(p->cwd);
-        save_session();
-        message_box("Успех", "Добавлено в избранное");
+    char paths[MAX_CLIP][PATH_MAX];
+    int count = get_selected_or_current(p, paths, MAX_CLIP);
+    if (count == 0) {
+        if (p->cwd[0]) add_bookmark(p->cwd);
+    } else {
+        for (int i = 0; i < count; i++) {
+            add_bookmark(paths[i]);
+        }
     }
+    save_config();
+    snprintf(g_app.last_action, sizeof g_app.last_action, "Добавлено в избранное");
+}
+
+static void action_info(FilePane *p) {
+    if (p->list.count == 0 || p->file_sel <= 0 || p->file_sel >= (int)p->list.count) {
+        message_box("Внимание", "Ничего не выбрано");
+        return;
+    }
+
+    Entry *e = &p->list.items[p->file_sel];
+
+    char full[PATH_MAX];
+    if (make_path(full, sizeof full, p->cwd, e->name) != 0) {
+        message_box("Ошибка", "Путь слишком длинный");
+        return;
+    }
+
+    struct stat st;
+    if (lstat(full, &st) != 0) {
+        message_box("Ошибка", "Не удалось получить информацию о файле");
+        return;
+    }
+
+    char type_buf[64];
+    if (S_ISREG(st.st_mode))       snprintf(type_buf, sizeof type_buf, "Обычный файл");
+    else if (S_ISDIR(st.st_mode))  snprintf(type_buf, sizeof type_buf, "Каталог");
+    else if (S_ISLNK(st.st_mode))  snprintf(type_buf, sizeof type_buf, "Символическая ссылка");
+    else if (S_ISBLK(st.st_mode))  snprintf(type_buf, sizeof type_buf, "Блочное устройство");
+    else if (S_ISCHR(st.st_mode))  snprintf(type_buf, sizeof type_buf, "Символьное устройство");
+    else if (S_ISFIFO(st.st_mode)) snprintf(type_buf, sizeof type_buf, "FIFO (pipe)");
+    else if (S_ISSOCK(st.st_mode)) snprintf(type_buf, sizeof type_buf, "Сокет");
+    else                           snprintf(type_buf, sizeof type_buf, "Неизвестный тип");
+
+    char perm[11];
+    perm[0] = S_ISDIR(st.st_mode)  ? 'd' :
+              S_ISLNK(st.st_mode)  ? 'l' :
+              S_ISBLK(st.st_mode)  ? 'b' :
+              S_ISCHR(st.st_mode)  ? 'c' :
+              S_ISFIFO(st.st_mode) ? 'p' :
+              S_ISSOCK(st.st_mode) ? 's' : '-';
+    perm[1] = (st.st_mode & S_IRUSR) ? 'r' : '-';
+    perm[2] = (st.st_mode & S_IWUSR) ? 'w' : '-';
+    perm[3] = (st.st_mode & S_IXUSR) ? ((st.st_mode & S_ISUID) ? 's' : 'x') : ((st.st_mode & S_ISUID) ? 'S' : '-');
+    perm[4] = (st.st_mode & S_IRGRP) ? 'r' : '-';
+    perm[5] = (st.st_mode & S_IWGRP) ? 'w' : '-';
+    perm[6] = (st.st_mode & S_IXGRP) ? ((st.st_mode & S_ISGID) ? 's' : 'x') : ((st.st_mode & S_ISGID) ? 'S' : '-');
+    perm[7] = (st.st_mode & S_IROTH) ? 'r' : '-';
+    perm[8] = (st.st_mode & S_IWOTH) ? 'w' : '-';
+    perm[9] = (st.st_mode & S_IXOTH) ? ((st.st_mode & S_ISVTX) ? 't' : 'x') : ((st.st_mode & S_ISVTX) ? 'T' : '-');
+    perm[10] = '\0';
+
+    char owner_buf[160], group_buf[160];
+    struct passwd *pw = getpwuid(st.st_uid);
+    struct group  *gr = getgrgid(st.st_gid);
+    if (pw) snprintf(owner_buf, sizeof owner_buf, "%s (UID %u)", pw->pw_name, (unsigned)st.st_uid);
+    else    snprintf(owner_buf, sizeof owner_buf, "UID %u", (unsigned)st.st_uid);
+    if (gr) snprintf(group_buf, sizeof group_buf, "%s (GID %u)", gr->gr_name, (unsigned)st.st_gid);
+    else    snprintf(group_buf, sizeof group_buf, "GID %u", (unsigned)st.st_gid);
+
+    char size_human[32];
+    format_size(size_human, sizeof size_human, st.st_size);
+
+    char atime_buf[64] = "?", mtime_buf[64] = "?", ctime_buf[64] = "?";
+    struct tm tmv;
+    if (localtime_r(&st.st_atime, &tmv)) strftime(atime_buf, sizeof atime_buf, "%Y-%m-%d %H:%M:%S", &tmv);
+    if (localtime_r(&st.st_mtime, &tmv)) strftime(mtime_buf, sizeof mtime_buf, "%Y-%m-%d %H:%M:%S", &tmv);
+    if (localtime_r(&st.st_ctime, &tmv)) strftime(ctime_buf, sizeof ctime_buf, "%Y-%m-%d %H:%M:%S", &tmv);
+
+    char link_target[PATH_MAX] = "";
+    if (S_ISLNK(st.st_mode)) {
+        ssize_t ln = readlink(full, link_target, sizeof link_target - 1);
+        if (ln > 0) link_target[ln] = '\0';
+        else link_target[0] = '\0';
+    }
+
+    char mime_buf[128] = "";
+    struct stat tgt_st;
+    if (stat(full, &tgt_st) == 0 && S_ISREG(tgt_st.st_mode)) {
+        if (get_mime_type(full, mime_buf, sizeof mime_buf) != 0) mime_buf[0] = '\0';
+    }
+
+    char info[4096];
+    int pos = 0;
+    #define APPEND(...) do { \
+        if ((size_t)pos < sizeof(info) - 1) { \
+            int _r = snprintf(info + pos, sizeof(info) - (size_t)pos, __VA_ARGS__); \
+            if (_r < 0 || (size_t)_r >= sizeof(info) - (size_t)pos) { \
+                pos = (int)sizeof(info) - 1; \
+                info[pos] = '\0'; \
+            } else { \
+                pos += _r; \
+            } \
+        } \
+    } while (0)
+
+    APPEND("Имя:            %s\n", e->name);
+    APPEND("Полный путь:    %s\n", full);
+    APPEND("Тип:            %s\n", type_buf);
+    if (mime_buf[0])
+        APPEND("MIME:           %s\n", mime_buf);
+    if (link_target[0])
+        APPEND("Ссылка на:      %s\n", link_target);
+    APPEND("\n");
+    APPEND("Размер:         %lld байт (%s)\n", (long long)st.st_size, size_human);
+    APPEND("Блоков:         %lld × %ld байт\n",
+           (long long)st.st_blocks, (long)st.st_blksize);
+    APPEND("\n");
+    APPEND("Права:          %s  (%04o)\n", perm, (unsigned)(st.st_mode & 07777));
+    APPEND("Владелец:       %s\n", owner_buf);
+    APPEND("Группа:         %s\n", group_buf);
+    APPEND("Жёстких ссылок: %ld\n", (long)st.st_nlink);
+    APPEND("\n");
+    APPEND("Inode:          %llu\n", (unsigned long long)st.st_ino);
+    APPEND("Устройство:     major=%u, minor=%u\n",
+           (unsigned)major(st.st_dev), (unsigned)minor(st.st_dev));
+    APPEND("\n");
+    APPEND("Изменён:        %s\n", mtime_buf);
+    APPEND("Открыт:         %s\n", atime_buf);
+    APPEND("Статус изменён: %s\n", ctime_buf);
+    #undef APPEND
+
+    if (pos < (int)sizeof(info)) info[pos] = '\0';
+    else info[sizeof(info) - 1] = '\0';
+
+    message_box("Свойства файла", info);
 }
 
 static int execute_action(int act, FilePane *p) {
@@ -1520,27 +2898,399 @@ static int execute_action(int act, FilePane *p) {
     case ACT_PIN: action_pin(p); break;
     case ACT_REFRESH: action_refresh(p); break;
     case ACT_QUIT: return 0;
-    case ACT_INFO:
-        if (p->list.count && p->file_sel < (int)p->list.count) {
-            char sizebuf[32], timebuf[64] = "?";
-            struct stat st;
-            char full[PATH_MAX];
-            if (make_path(full, sizeof full, p->cwd, p->list.items[p->file_sel].name) == 0 && stat(full, &st) == 0) {
-                format_size(sizebuf, sizeof sizebuf, st.st_size);
-                struct tm tmv;
-                if (localtime_r(&st.st_mtime, &tmv)) strftime(timebuf, sizeof timebuf, "%Y-%m-%d %H:%M:%S", &tmv);
-                char info[1024];
-                char name_trunc[64];
-                snprintf(name_trunc, sizeof name_trunc, "%.60s", p->list.items[p->file_sel].name);
-                snprintf(info, sizeof info, "Имя:   %s\nРазмер: %s\nИзменён: %s", 
-                         name_trunc, sizebuf, timebuf);
-                message_box("Свойства", info);
-            }
-        } else message_box("Внимание", "Ничего не выбрано");
-        break;
+    case ACT_INFO: action_info(p); break;
     default: break;
     }
     return 1;
+}
+
+/* =========================================================================
+ * НАСТРОЙКИ (O)
+ * ========================================================================= */
+
+enum {
+    SK_HEADER,
+    SK_EMPTY,
+    SK_RESET,
+    SK_THEME,
+    SK_BIND,
+    SK_ASSOC,
+    SK_ADD
+};
+
+typedef struct {
+    int kind;
+    int id;
+    char label[128];
+} SettingItem;
+
+static void binding_key_to_str(int k, char *out, size_t outsz) {
+    if (k == '\n') snprintf(out, outsz, "Enter");
+    else if (k == '\t') snprintf(out, outsz, "Tab");
+    else if (k == ' ') snprintf(out, outsz, "Space");
+    else if (k == 27) snprintf(out, outsz, "Esc");
+    else if (k >= 32 && k < 127) { out[0] = (char)k; out[1] = '\0'; }
+    else snprintf(out, outsz, "?");
+}
+
+static void binding_key_to_input(int k, char *out, size_t outsz) {
+    if (k == '\n') snprintf(out, outsz, "\\n");
+    else if (k == '\t') snprintf(out, outsz, "\\t");
+    else if (k == ' ') snprintf(out, outsz, "\\s");
+    else if (k == 27) snprintf(out, outsz, "\\e");
+    else if (k >= 32 && k < 127) { out[0] = (char)k; out[1] = '\0'; }
+    else snprintf(out, outsz, "?");
+}
+
+static int binding_input_to_key(const char *s) {
+    if (s[0] == '\\') {
+        if (s[1] == 'n') return '\n';
+        if (s[1] == 't') return '\t';
+        if (s[1] == 's') return ' ';
+        if (s[1] == 'e') return 27;
+        return 0;
+    }
+    unsigned char c = (unsigned char)s[0];
+    if (c >= 32 && c < 127) return c;
+    return 0;
+}
+
+static void build_settings_items(SettingItem *items, int *count_out) {
+    int n = 0;
+
+    items[n].kind = SK_HEADER; items[n].id = 0;
+    snprintf(items[n].label, sizeof items[n].label, "Сбросы");
+    n++;
+
+    items[n].kind = SK_RESET; items[n].id = 0;
+    snprintf(items[n].label, sizeof items[n].label, "Сбросить настройки (тему и ассоциации)");
+    n++;
+    items[n].kind = SK_RESET; items[n].id = 1;
+    snprintf(items[n].label, sizeof items[n].label, "Сбросить избранное");
+    n++;
+    items[n].kind = SK_RESET; items[n].id = 2;
+    snprintf(items[n].label, sizeof items[n].label, "Сбросить цвета темы");
+    n++;
+    items[n].kind = SK_RESET; items[n].id = 3;
+    snprintf(items[n].label, sizeof items[n].label, "Сбросить бинды к стандартным");
+    n++;
+
+    items[n].kind = SK_EMPTY; items[n].id = 0; items[n].label[0] = '\0';
+    n++;
+
+    items[n].kind = SK_HEADER; items[n].id = 0;
+    snprintf(items[n].label, sizeof items[n].label, "Тема");
+    n++;
+    for (int i = 0; i < THEME_FIELDS; i++) {
+        items[n].kind = SK_THEME; items[n].id = i;
+        snprintf(items[n].label, sizeof items[n].label, "%s", theme_name_by_idx(i));
+        n++;
+    }
+
+    items[n].kind = SK_EMPTY; items[n].id = 0; items[n].label[0] = '\0';
+    n++;
+
+    items[n].kind = SK_HEADER; items[n].id = 0;
+    snprintf(items[n].label, sizeof items[n].label, "Бинды");
+    n++;
+    for (int i = 0; i < g_app.binding_count; i++) {
+        items[n].kind = SK_BIND; items[n].id = i;
+        snprintf(items[n].label, sizeof items[n].label, "%s", g_app.bindings[i].name);
+        n++;
+    }
+
+    items[n].kind = SK_EMPTY; items[n].id = 0; items[n].label[0] = '\0';
+    n++;
+
+    items[n].kind = SK_HEADER; items[n].id = 0;
+    snprintf(items[n].label, sizeof items[n].label, "Ассоциации файлов");
+    n++;
+    for (int i = 0; i < g_app.assoc_count; i++) {
+        items[n].kind = SK_ASSOC; items[n].id = i;
+        snprintf(items[n].label, sizeof items[n].label, ".%s", g_app.associations[i].ext);
+        n++;
+    }
+    items[n].kind = SK_ADD; items[n].id = 0;
+    snprintf(items[n].label, sizeof items[n].label, "Добавить ассоциацию");
+    n++;
+
+    *count_out = n;
+}
+
+static void run_settings_menu(void) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+
+    int h = (rows * 64) / 100;
+    if (h > rows - 4) h = rows - 4;
+    if (h < 12) h = 12;
+
+    int w = 76;
+    int w_max = cols * 80 / 100;
+    if (w > w_max) w = w_max;
+    if (w > cols - 4) w = cols - 4;
+    if (w < 50) w = 50;
+
+    int y = (rows - h) / 2, x = (cols - w) / 2;
+
+    apply_shadow(y, x, h, w);
+    WINDOW *win = newwin(h, w, y, x);
+    wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+    keypad(win, TRUE);
+    box(win, 0, 0);
+
+    int sel = 0;
+    int scroll = 0;
+    int running = 1;
+    int vis = h - 4;
+    if (vis < 1) vis = 1;
+
+    while (running) {
+        SettingItem items[256];
+        int count = 0;
+        build_settings_items(items, &count);
+
+        if (sel >= count) sel = count - 1;
+        if (sel < 0) sel = 0;
+        while (sel < count && (items[sel].kind == SK_HEADER || items[sel].kind == SK_EMPTY)) sel++;
+        if (sel >= count) {
+            sel = count - 1;
+            while (sel > 0 && (items[sel].kind == SK_HEADER || items[sel].kind == SK_EMPTY)) sel--;
+        }
+
+        if (sel < scroll) scroll = sel;
+        if (sel >= scroll + vis) scroll = sel - vis + 1;
+        if (scroll < 0) scroll = 0;
+
+        werase(win);
+        box(win, 0, 0);
+        mvwaddnstr(win, 0, 2, " Настройки ", w - 4);
+
+        for (int i = 0; i < vis; i++) {
+            int idx = scroll + i;
+            if (idx >= count) break;
+            SettingItem *item = &items[idx];
+
+            if (item->kind == SK_HEADER) {
+                wattron(win, A_HEADER_GRAY);
+                mvwhline(win, 1 + i, 1, ' ', w - 2);
+                mvwprintw(win, 1 + i, 2, " %s ", item->label);
+                wattroff(win, A_HEADER_GRAY);
+                continue;
+            }
+            if (item->kind == SK_EMPTY) {
+                continue;
+            }
+
+            int attr = (idx == sel) ? A_MENU_SEL : A_MENU_NORMAL;
+            wattron(win, attr);
+            mvwhline(win, 1 + i, 1, ' ', w - 2);
+
+            if (item->kind == SK_RESET) {
+                mvwprintw(win, 1 + i, 2, " %s ", item->label);
+            } else if (item->kind == SK_THEME) {
+                char *val = theme_field_by_idx(item->id);
+                mvwprintw(win, 1 + i, 2, " %-20s [%s]", item->label, val ? val : "");
+            } else if (item->kind == SK_BIND) {
+                char kbuf[16];
+                binding_key_to_str(g_app.bindings[item->id].key, kbuf, sizeof kbuf);
+                mvwprintw(win, 1 + i, 2, " %-20s [%s]", item->label, kbuf);
+            } else if (item->kind == SK_ASSOC) {
+                mvwprintw(win, 1 + i, 2, " %-20s [%s]",
+                          item->label, g_app.associations[item->id].cmd);
+            } else if (item->kind == SK_ADD) {
+                mvwprintw(win, 1 + i, 2, " [ %s ]", item->label);
+            }
+            wattroff(win, attr);
+        }
+
+        if (count > vis) {
+            int bar_x = w - 2;
+            int bar_h = h - 3;
+            int thumb_h = (bar_h * vis) / count;
+            if (thumb_h < 1) thumb_h = 1;
+            int max_scroll = count - vis;
+            int thumb_pos = max_scroll > 0 ? (bar_h - thumb_h) * scroll / max_scroll : 0;
+            if (thumb_pos + thumb_h > bar_h) thumb_pos = bar_h - thumb_h;
+            for (int i = 0; i < bar_h; i++) {
+                if (i >= thumb_pos && i < thumb_pos + thumb_h) {
+                    wattron(win, A_SCROLL_THUMB);
+                    mvwaddch(win, 1 + i, bar_x, ' ');
+                    wattroff(win, A_SCROLL_THUMB);
+                } else {
+                    wattron(win, A_MENU_NORMAL);
+                    mvwaddch(win, 1 + i, bar_x, ACS_VLINE);
+                    wattroff(win, A_MENU_NORMAL);
+                }
+            }
+        }
+
+        mvwprintw(win, h - 2, 2, "j/k - выбор, Enter - изменить, d - удалить, Esc/O - выход");
+        wrefresh(win);
+
+        int ch = wgetch(win);
+        if (ch == 27 || ch == 'o' || ch == 'O' || ch == 'q') {
+            running = 0;
+        } else if (ch == KEY_DOWN || ch == 'j') {
+            int next = sel + 1;
+            while (next < count && (items[next].kind == SK_HEADER || items[next].kind == SK_EMPTY)) next++;
+            if (next < count) sel = next;
+        } else if (ch == KEY_UP || ch == 'k') {
+            int prev = sel - 1;
+            while (prev >= 0 && (items[prev].kind == SK_HEADER || items[prev].kind == SK_EMPTY)) prev--;
+            if (prev >= 0) sel = prev;
+        } else if (ch == KEY_NPAGE || ch == CTRL('d')) {
+            sel += vis / 2;
+            if (sel >= count) sel = count - 1;
+            while (sel > 0 && (items[sel].kind == SK_HEADER || items[sel].kind == SK_EMPTY)) sel--;
+        } else if (ch == KEY_PPAGE || ch == CTRL('u')) {
+            sel -= vis / 2;
+            if (sel < 0) sel = 0;
+            while (sel < count - 1 && (items[sel].kind == SK_HEADER || items[sel].kind == SK_EMPTY)) sel++;
+        } else if (ch == '\n' || ch == KEY_ENTER) {
+            SettingItem *item = &items[sel];
+            if (item->kind == SK_RESET) {
+                if (item->id == 0) {
+                    if (dialog_confirm("Сброс", "Сбросить настройки (тему, бинды и ассоциации)?")) {
+                        default_config();
+                        default_bindings();
+                        g_app.assoc_count = 0;
+                        g_theme_raw[0] = '\0';
+                        g_new_theme_seen = 0;
+                        init_attributes();
+                        save_config();
+
+                        clearok(stdscr, TRUE);
+                        wbkgd(stdscr, COLOR_PAIR(PAIR_BG));
+                        clearok(win, TRUE);
+                        wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+                        wnoutrefresh(stdscr);
+                        wnoutrefresh(win);
+                        doupdate();
+                    }
+                } else if (item->id == 1) {
+                    if (dialog_confirm("Сброс", "Очистить избранное?")) {
+                        g_app.bookmark_count = 0;
+                        save_config();
+                    }
+                } else if (item->id == 2) {
+                    if (dialog_confirm("Сброс", "Сбросить цвета темы?")) {
+                        default_config();
+                        g_theme_raw[0] = '\0';
+                        g_new_theme_seen = 0;
+                        init_attributes();
+                        save_config();
+
+                        clearok(stdscr, TRUE);
+                        wbkgd(stdscr, COLOR_PAIR(PAIR_BG));
+                        clearok(win, TRUE);
+                        wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+                        wnoutrefresh(stdscr);
+                        wnoutrefresh(win);
+                        doupdate();
+                    }
+                } else if (item->id == 3) {
+                    if (dialog_confirm("Сброс", "Сбросить бинды к стандартным?")) {
+                        default_bindings();
+                        save_config();
+                    }
+                }
+            } else if (item->kind == SK_THEME) {
+                char *val = theme_field_by_idx(item->id);
+                if (val) {
+                    char buf[16];
+                    copy_str(buf, sizeof buf, val);
+                    if (dialog_input("Цвет", "Значение (hex):", buf, sizeof buf)) {
+                        copy_str(val, 8, buf);
+                        g_theme_raw[0] = '\0';
+                        init_attributes();
+                        save_config();
+
+                        clearok(stdscr, TRUE);
+                        wbkgd(stdscr, COLOR_PAIR(PAIR_BG));
+                        clearok(win, TRUE);
+                        wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+                        wnoutrefresh(stdscr);
+                        wnoutrefresh(win);
+                        doupdate();
+                    }
+                }
+            } else if (item->kind == SK_BIND) {
+                char buf[16];
+                binding_key_to_input(g_app.bindings[item->id].key, buf, sizeof buf);
+                if (dialog_input("Бинд", "Символ или \\n, \\t, \\s, \\e:", buf, sizeof buf)) {
+                    int nk = binding_input_to_key(buf);
+                    if (nk) {
+                        g_app.bindings[item->id].key = nk;
+                        save_config();
+                    }
+                }
+            } else if (item->kind == SK_ASSOC) {
+                char buf[PATH_MAX];
+                copy_str(buf, sizeof buf, g_app.associations[item->id].cmd);
+                if (dialog_input("Команда", "Программа:", buf, sizeof buf)) {
+                    copy_str(g_app.associations[item->id].cmd, PATH_MAX, buf);
+                    save_config();
+                }
+            } else if (item->kind == SK_ADD) {
+                if (g_app.assoc_count >= MAX_ASSOC) {
+                    message_box("Внимание", "Достигнут лимит ассоциаций");
+                } else {
+                    char ext[64] = "";
+                    if (dialog_input("Новая ассоциация", "Расширение (без точки):", ext, sizeof ext)) {
+                        char *p = ext;
+                        while (*p == '.') p++;
+                        while (*p == ' ' || *p == '\t') p++;
+                        if (*p) {
+                            char cmd[PATH_MAX] = "xdg-open";
+                            if (dialog_input("Новая ассоциация", "Программа:", cmd, sizeof cmd)) {
+                                copy_str(g_app.associations[g_app.assoc_count].ext, 32, p);
+                                copy_str(g_app.associations[g_app.assoc_count].cmd, PATH_MAX, cmd);
+                                g_app.assoc_count++;
+                                save_config();
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (ch == 'd' || ch == 'D') {
+            SettingItem *item = &items[sel];
+            if (item->kind == SK_ASSOC) {
+                char msg[160];
+                snprintf(msg, sizeof msg, "Удалить ассоциацию %s?", item->label);
+                if (dialog_confirm("Удаление", msg)) {
+                    for (int i = item->id; i < g_app.assoc_count - 1; i++) {
+                        g_app.associations[i] = g_app.associations[i + 1];
+                    }
+                    g_app.assoc_count--;
+                    save_config();
+                }
+            }
+        } else if (ch == KEY_RESIZE) {
+            delwin(win);
+            getmaxyx(stdscr, rows, cols);
+            h = (rows * 64) / 100;
+            if (h > rows - 4) h = rows - 4;
+            if (h < 12) h = 12;
+            w = 76;
+            w_max = cols * 80 / 100;
+            if (w > w_max) w = w_max;
+            if (w > cols - 4) w = cols - 4;
+            if (w < 50) w = 50;
+            y = (rows - h) / 2; x = (cols - w) / 2;
+            vis = h - 4;
+            if (vis < 1) vis = 1;
+            apply_shadow(y, x, h, w);
+            win = newwin(h, w, y, x);
+            wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+            keypad(win, TRUE);
+            box(win, 0, 0);
+        }
+    }
+
+    delwin(win);
+    touchwin(stdscr);
+    refresh();
 }
 
 /* =========================================================================
@@ -1557,32 +3307,32 @@ static int run_submenu(const char *title, const char **options, int count) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     int start_x = (cols - menu_w) / 2, start_y = (rows - menu_h) / 2;
-    
+
     apply_shadow(start_y, start_x, menu_h, menu_w);
     WINDOW *win = newwin(menu_h, menu_w, start_y, start_x);
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     keypad(win, TRUE);
     box(win, 0, 0);
-    
+
     int sel = 0, ch, res = -1, running = 1;
     while (running) {
         werase(win);
         box(win, 0, 0);
-        
+
         wattron(win, A_HEADER_GRAY);
         mvwhline(win, 0, 1, ' ', menu_w - 2);
         mvwprintw(win, 0, (menu_w - utf8_strlen(title)) / 2, "%s", title);
         wattroff(win, A_HEADER_GRAY);
-        
+
         for (int i = 0; i < count; i++) {
-            int attr = (i == sel) ? A_SEL_ACTIVE : A_PANEL;
+            int attr = (i == sel) ? A_MENU_SEL : A_MENU_NORMAL;
             wattron(win, attr);
             mvwhline(win, 1 + i, 1, ' ', menu_w - 2);
             mvwprintw(win, 1 + i, 2, "%-*s", menu_w - 4, options[i]);
             wattroff(win, attr);
         }
         wrefresh(win);
-        
+
         ch = get_key(0);
         if (ch == 27 || ch == 'a') running = 0;
         else if (ch == KEY_DOWN || ch == 'j') sel = (sel + 1) % count;
@@ -1617,36 +3367,70 @@ static int run_menu(FilePane *p) {
         int len = utf8_strlen(ACTION_NAMES[i]);
         if (len > max_len) max_len = len;
     }
-    int menu_w = max_len + 6, menu_h = ACT_COUNT + 2;
+
+    int vis = ACT_COUNT < MENU_MAX_VIS ? ACT_COUNT : MENU_MAX_VIS;
+    int needs_scroll = (ACT_COUNT > vis);
+    int menu_w = max_len + 6 + (needs_scroll ? 1 : 0);
+    int menu_h = vis + 2;
+
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     int start_x = (cols - menu_w) / 2, start_y = (rows - menu_h) / 2;
-    
+
     apply_shadow(start_y, start_x, menu_h, menu_w);
     WINDOW *win = newwin(menu_h, menu_w, start_y, start_x);
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     keypad(win, TRUE);
     box(win, 0, 0);
-    
+
     int sel = 0, ch, running = 1, res = 1;
+    int scroll = 0;
+    int content_w = menu_w - 2 - (needs_scroll ? 1 : 0);
+
     while (running) {
         werase(win);
         box(win, 0, 0);
-        
+
         wattron(win, A_HEADER_GRAY);
         mvwhline(win, 0, 1, ' ', menu_w - 2);
         mvwprintw(win, 0, (menu_w - utf8_strlen("Действия")) / 2, "Действия");
         wattroff(win, A_HEADER_GRAY);
-        
-        for (int i = 0; i < ACT_COUNT; i++) {
-            int attr = (i == sel) ? A_SEL_ACTIVE : A_PANEL;
+
+        if (sel < scroll) scroll = sel;
+        if (sel >= scroll + vis) scroll = sel - vis + 1;
+
+        for (int i = 0; i < vis; i++) {
+            int idx = scroll + i;
+            if (idx >= ACT_COUNT) break;
+            int attr = (idx == sel) ? A_MENU_SEL : A_MENU_NORMAL;
             wattron(win, attr);
-            mvwhline(win, 1 + i, 1, ' ', menu_w - 2);
-            mvwprintw(win, 1 + i, 2, "%-*s", menu_w - 4, ACTION_NAMES[i]);
+            mvwhline(win, 1 + i, 1, ' ', content_w);
+            mvwprintw(win, 1 + i, 2, "%-*s", content_w - 2, ACTION_NAMES[idx]);
             wattroff(win, attr);
         }
+
+        if (needs_scroll) {
+            int bar_x = menu_w - 2;
+            int bar_h = menu_h - 2;
+            int thumb_h = (bar_h * vis) / ACT_COUNT;
+            if (thumb_h < 1) thumb_h = 1;
+            int max_scroll = ACT_COUNT - vis;
+            int thumb_pos = max_scroll > 0 ? (bar_h - thumb_h) * scroll / max_scroll : 0;
+            if (thumb_pos + thumb_h > bar_h) thumb_pos = bar_h - thumb_h;
+            for (int i = 0; i < bar_h; i++) {
+                if (i >= thumb_pos && i < thumb_pos + thumb_h) {
+                    wattron(win, A_SCROLL_THUMB);
+                    mvwaddch(win, 1 + i, bar_x, ' ');
+                    wattroff(win, A_SCROLL_THUMB);
+                } else {
+                    wattron(win, A_MENU_NORMAL);
+                    mvwaddch(win, 1 + i, bar_x, ACS_VLINE);
+                    wattroff(win, A_MENU_NORMAL);
+                }
+            }
+        }
         wrefresh(win);
-        
+
         ch = get_key(0);
         if (ch == 27 || ch == 'a') running = 0;
         else if (ch == KEY_DOWN || ch == 'j') sel = (sel + 1) % ACT_COUNT;
@@ -1656,7 +3440,7 @@ static int run_menu(FilePane *p) {
             MEVENT ev;
             if (getmouse(&ev) == OK && (ev.bstate & (BUTTON1_CLICKED | BUTTON1_DOUBLE_CLICKED))) {
                 if (ev.x >= start_x && ev.x < start_x + menu_w && ev.y > start_y && ev.y < start_y + menu_h - 1) {
-                    int clicked = ev.y - start_y - 1;
+                    int clicked = scroll + (ev.y - start_y - 1);
                     if (clicked >= 0 && clicked < ACT_COUNT) {
                         sel = clicked;
                         if (ev.bstate & BUTTON1_DOUBLE_CLICKED) { res = execute_action(sel, p); running = 0; }
@@ -1669,9 +3453,24 @@ static int run_menu(FilePane *p) {
     return res;
 }
 
+static void open_bookmark(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            enter_dir(path, &ACTIVE_PANE);
+        } else {
+            const char *base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            launch_path(base, path);
+        }
+    } else {
+        message_box("Ошибка", "Не удалось открыть закладку");
+    }
+}
+
 static void run_bookmarks_menu(void) {
     if (g_app.bookmark_count == 0) { message_box("Избранное", "Список пуст"); return; }
-    
+
     int max_len = 10;
     for (int i = 0; i < g_app.bookmark_count; i++) {
         int len = utf8_strlen(g_app.bookmarks[i]);
@@ -1681,36 +3480,36 @@ static void run_bookmarks_menu(void) {
     if (menu_w > 60) menu_w = 60;
     int menu_h = g_app.bookmark_count + 2;
     if (menu_h > 20) menu_h = 20;
-    
+
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     int start_x = (cols - menu_w) / 2, start_y = (rows - menu_h) / 2;
-    
+
     apply_shadow(start_y, start_x, menu_h, menu_w);
     WINDOW *win = newwin(menu_h, menu_w, start_y, start_x);
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     keypad(win, TRUE);
     box(win, 0, 0);
-    
+
     int sel = 0, ch, running = 1, scroll = 0;
     int vis = menu_h - 2;
-    
+
     while (running) {
         werase(win);
         box(win, 0, 0);
-        
+
         wattron(win, A_HEADER_GRAY);
         mvwhline(win, 0, 1, ' ', menu_w - 2);
         mvwprintw(win, 0, (menu_w - 13) / 2, " Избранное ");
         wattroff(win, A_HEADER_GRAY);
-        
+
         if (sel < scroll) scroll = sel;
         if (sel >= scroll + vis) scroll = sel - vis + 1;
-        
+
         for (int i = 0; i < vis; i++) {
             int idx = scroll + i;
             if (idx >= g_app.bookmark_count) break;
-            int attr = (idx == sel) ? A_SEL_ACTIVE : A_PANEL;
+            int attr = (idx == sel) ? A_MENU_SEL : A_MENU_NORMAL;
             wattron(win, attr);
             mvwhline(win, 1 + i, 1, ' ', menu_w - 2);
             char disp[PATH_MAX + 2];
@@ -1719,7 +3518,7 @@ static void run_bookmarks_menu(void) {
             wattroff(win, attr);
         }
         wrefresh(win);
-        
+
         ch = get_key(0);
         if (ch == 27 || ch == 'p' || ch == 'P') {
             running = 0;
@@ -1728,7 +3527,7 @@ static void run_bookmarks_menu(void) {
         } else if (ch == KEY_UP || ch == 'k') {
             sel = (sel - 1 + g_app.bookmark_count) % g_app.bookmark_count;
         } else if (ch == '\n' || ch == KEY_ENTER) {
-            enter_dir(g_app.bookmarks[sel], &ACTIVE_PANE);
+            open_bookmark(g_app.bookmarks[sel]);
             running = 0;
         } else if (ch == 'd' || ch == 'D') {
             char msg[PATH_MAX + 64];
@@ -1738,6 +3537,7 @@ static void run_bookmarks_menu(void) {
                     copy_str(g_app.bookmarks[i], PATH_MAX, g_app.bookmarks[i+1]);
                 }
                 g_app.bookmark_count--;
+                save_config();
                 if (g_app.bookmark_count == 0) { running = 0; }
                 else if (sel >= g_app.bookmark_count) sel = g_app.bookmark_count - 1;
                 werase(stdscr); refresh();
@@ -1750,7 +3550,7 @@ static void run_bookmarks_menu(void) {
                     if (clicked >= 0 && clicked < g_app.bookmark_count) {
                         sel = clicked;
                         if (ev.bstate & BUTTON1_DOUBLE_CLICKED) {
-                            enter_dir(g_app.bookmarks[sel], &ACTIVE_PANE);
+                            open_bookmark(g_app.bookmarks[sel]);
                             running = 0;
                         }
                     }
@@ -1776,7 +3576,8 @@ static void run_bookmarks_menu(void) {
 static void switch_tab(int idx) {
     if (idx < 0 || idx >= NUM_TABS || idx == g_app.active_tab) return;
     g_app.active_tab = idx;
-    
+    g_app.last_action[0] = '\0';
+
     if (ACTIVE_PANE.cwd[0] == '\0') {
         const char *home = getenv("HOME");
         copy_str(ACTIVE_PANE.cwd, sizeof ACTIVE_PANE.cwd, home ? home : "/");
@@ -1788,27 +3589,43 @@ static void handle_mouse(MEVENT ev) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
 
-    if (ev.y == 0 && ev.x >= cols - 4) {
-        g_app.running = 0;
-        return;
+    if (ev.y == 0) {
+        if (ev.x >= cols - 4 && ev.x <= cols - 2) {
+            g_app.running = 0;
+            return;
+        } else if (ev.x >= cols - 8 && ev.x <= cols - 6) {
+            run_settings_menu();
+            return;
+        } else if (ev.x >= cols - 12 && ev.x <= cols - 10) {
+            run_bookmarks_menu();
+            return;
+        } else if (ev.x >= cols - 16 && ev.x <= cols - 14) {
+            if (!run_menu(&ACTIVE_PANE)) g_app.running = 0;
+            return;
+        }
     }
 
     if (ev.bstate & BUTTON3_CLICKED) {
         if (!run_menu(&ACTIVE_PANE)) g_app.running = 0;
     } else if (ev.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_DOUBLE_CLICKED)) {
         if (ev.y == rows - 1) {
-            int tab_idx = ev.x / (cols / NUM_TABS);
-            if (tab_idx >= 0 && tab_idx < NUM_TABS) switch_tab(tab_idx);
+            if (!g_app.search_active) {
+                int tab_idx = ev.x / (cols / NUM_TABS);
+                if (tab_idx >= 0 && tab_idx < NUM_TABS) switch_tab(tab_idx);
+            }
         }
         else if (ev.y == 1) {
-            int pane_idx = (CURRENT_TAB.split_mode && ev.x >= cols / 2) ? 1 : 0;
+            if (CURRENT_TAB.preview_mode && ev.x >= cols / 2) {
+                return;
+            }
+            int pane_idx = CURRENT_TAB.split_mode ? (ev.x >= cols / 2 ? 1 : 0) : CURRENT_TAB.active_pane;
             FilePane *p = &CURRENT_TAB.panes[pane_idx];
             int new_field = -1;
-            
-            if (ev.x >= g_app.g_x_name[pane_idx] && (g_app.g_x_type[pane_idx] == -1 || ev.x < g_app.g_x_type[pane_idx])) new_field = SORT_NAME;
-            else if (g_app.g_x_type[pane_idx] != -1 && ev.x >= g_app.g_x_type[pane_idx] && (g_app.g_x_date[pane_idx] == -1 || ev.x < g_app.g_x_date[pane_idx])) new_field = SORT_TYPE;
-            else if (g_app.g_x_date[pane_idx] != -1 && ev.x >= g_app.g_x_date[pane_idx] && ev.x < g_app.g_x_size[pane_idx]) new_field = SORT_DATE;
-            else if (g_app.g_x_size[pane_idx] != -1 && ev.x >= g_app.g_x_size[pane_idx]) new_field = SORT_SIZE;
+
+            if (g_app.g_x_size[pane_idx] != -1 && ev.x >= g_app.g_x_size[pane_idx]) new_field = SORT_SIZE;
+            else if (g_app.g_x_date[pane_idx] != -1 && ev.x >= g_app.g_x_date[pane_idx]) new_field = SORT_DATE;
+            else if (g_app.g_x_type[pane_idx] != -1 && ev.x >= g_app.g_x_type[pane_idx]) new_field = SORT_TYPE;
+            else if (g_app.g_x_name[pane_idx] != 0 && ev.x >= g_app.g_x_name[pane_idx]) new_field = SORT_NAME;
 
             if (new_field != -1) {
                 if (p->sort_field == (SortField)new_field) p->sort_desc = !p->sort_desc;
@@ -1816,10 +3633,10 @@ static void handle_mouse(MEVENT ev) {
                 do_sort(p);
             }
         }
-        else if (ev.y >= 2 && ev.y < rows - 1) {
-            int pane_idx = (CURRENT_TAB.split_mode && ev.x >= cols / 2) ? 1 : 0;
+        else if (ev.y >= 2 && ev.y < rows - 2) {
+            int pane_idx = CURRENT_TAB.split_mode ? (ev.x >= cols / 2 ? 1 : 0) : CURRENT_TAB.active_pane;
             if (CURRENT_TAB.preview_mode && pane_idx == 1) return;
-            
+
             FilePane *p = &CURRENT_TAB.panes[pane_idx];
             int idx = p->file_top + (ev.y - 2);
             if (idx >= 0 && idx < (int)p->list.count) {
@@ -1837,7 +3654,7 @@ static void handle_key(int ch) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     (void)cols;
-    int vis = rows - 3;
+    int vis = rows - 4;
     if (vis < 1) vis = 1;
 
     if (g_app.search_active) {
@@ -1884,49 +3701,81 @@ static void handle_key(int ch) {
         return;
     }
 
+    g_app.last_action[0] = '\0';
+
+    const char *bound = NULL;
+    for (int i = 0; i < g_app.binding_count; i++) {
+        if (g_app.bindings[i].key == ch) { bound = g_app.bindings[i].name; break; }
+    }
+
+    if (bound) {
+        if (!strcmp(bound, "quit")) { g_app.running = 0; return; }
+        if (!strcmp(bound, "menu")) { if (!run_menu(&ACTIVE_PANE)) g_app.running = 0; return; }
+        if (!strcmp(bound, "bookmarks")) { run_bookmarks_menu(); return; }
+        if (!strcmp(bound, "settings")) { run_settings_menu(); return; }
+        if (!strcmp(bound, "help")) { show_help(); return; }
+        if (!strcmp(bound, "sort_next")) {
+            ACTIVE_PANE.sort_field = (ACTIVE_PANE.sort_field + 1) % SORT_COUNT;
+            do_sort(&ACTIVE_PANE);
+            return;
+        }
+        if (!strcmp(bound, "sort_reverse")) {
+            ACTIVE_PANE.sort_desc = !ACTIVE_PANE.sort_desc;
+            do_sort(&ACTIVE_PANE);
+            return;
+        }
+        if (!strcmp(bound, "split")) {
+            CURRENT_TAB.split_mode = !CURRENT_TAB.split_mode;
+            if (!CURRENT_TAB.split_mode) CURRENT_TAB.preview_mode = 0;
+            if (CURRENT_TAB.split_mode && CURRENT_TAB.panes[1].cwd[0] == '\0') {
+                copy_str(CURRENT_TAB.panes[1].cwd, sizeof CURRENT_TAB.panes[1].cwd, ACTIVE_PANE.cwd);
+                load_dir(&CURRENT_TAB.panes[1]);
+            }
+            return;
+        }
+        if (!strcmp(bound, "preview")) {
+            CURRENT_TAB.preview_mode = !CURRENT_TAB.preview_mode;
+            if (CURRENT_TAB.preview_mode) CURRENT_TAB.split_mode = 1;
+            return;
+        }
+        if (!strcmp(bound, "select")) {
+            if (ACTIVE_PANE.file_sel > 0 && ACTIVE_PANE.file_sel < (int)ACTIVE_PANE.list.count) {
+                ACTIVE_PANE.list.items[ACTIVE_PANE.file_sel].selected ^= 1;
+                if (ACTIVE_PANE.file_sel + 1 < (int)ACTIVE_PANE.list.count) ACTIVE_PANE.file_sel++;
+            }
+            return;
+        }
+        if (!strcmp(bound, "search")) { g_app.search_active = 1; g_app.search_len = 0; g_app.search_buf[0] = 0; return; }
+        if (!strcmp(bound, "refresh")) { action_refresh(&ACTIVE_PANE); return; }
+        if (!strcmp(bound, "refresh_full")) { action_refresh(&ACTIVE_PANE); clearok(stdscr, TRUE); return; }
+        if (!strcmp(bound, "up")) { if (ACTIVE_PANE.file_sel > 0) ACTIVE_PANE.file_sel--; return; }
+        if (!strcmp(bound, "down")) { if (ACTIVE_PANE.file_sel + 1 < (int)ACTIVE_PANE.list.count) ACTIVE_PANE.file_sel++; return; }
+        if (!strcmp(bound, "home")) { ACTIVE_PANE.file_sel = 0; ACTIVE_PANE.file_top = 0; return; }
+        if (!strcmp(bound, "end")) { ACTIVE_PANE.file_sel = ACTIVE_PANE.list.count ? (int)ACTIVE_PANE.list.count - 1 : 0; return; }
+        if (!strcmp(bound, "parent")) {
+            if (!CURRENT_TAB.preview_mode || CURRENT_TAB.active_pane == 0) action_open(&ACTIVE_PANE);
+            return;
+        }
+        if (!strcmp(bound, "open") || !strcmp(bound, "open_l")) {
+            if (!CURRENT_TAB.preview_mode || CURRENT_TAB.active_pane == 0) action_open(&ACTIVE_PANE);
+            return;
+        }
+    }
+
     switch (ch) {
-    case 'q': g_app.running = 0; break;
-    case 'a': case 'A': if (!run_menu(&ACTIVE_PANE)) g_app.running = 0; break;
-    case 'p': case 'P': run_bookmarks_menu(); break;
-    case 'i': case 'I': show_help(); break;
     case KEY_F(1): switch_tab(0); break;
     case KEY_F(2): switch_tab(1); break;
     case KEY_F(3): switch_tab(2); break;
     case KEY_F(4): switch_tab(3); break;
-    case '/': g_app.search_active = 1; g_app.search_len = 0; g_app.search_buf[0] = 0; break;
-    case 's': ACTIVE_PANE.sort_field = (ACTIVE_PANE.sort_field + 1) % SORT_COUNT; do_sort(&ACTIVE_PANE); break;
-    case 'S': ACTIVE_PANE.sort_desc = !ACTIVE_PANE.sort_desc; do_sort(&ACTIVE_PANE); break;
-    
-    case 'm': case 'M':
-        CURRENT_TAB.split_mode = !CURRENT_TAB.split_mode;
-        if (!CURRENT_TAB.split_mode) CURRENT_TAB.preview_mode = 0;
-        if (CURRENT_TAB.split_mode && CURRENT_TAB.panes[1].cwd[0] == '\0') {
-            copy_str(CURRENT_TAB.panes[1].cwd, sizeof CURRENT_TAB.panes[1].cwd, ACTIVE_PANE.cwd);
-            load_dir(&CURRENT_TAB.panes[1]);
-        }
+    case '\t':
+        if (CURRENT_TAB.split_mode && !CURRENT_TAB.preview_mode) CURRENT_TAB.active_pane ^= 1;
         break;
-        
-    case 'v': case 'V':
-        CURRENT_TAB.preview_mode = !CURRENT_TAB.preview_mode;
-        if (CURRENT_TAB.preview_mode) CURRENT_TAB.split_mode = 1;
-        break;
-
-    case ' ':
-        if (ACTIVE_PANE.file_sel > 0 && ACTIVE_PANE.file_sel < (int)ACTIVE_PANE.list.count) {
-            ACTIVE_PANE.list.items[ACTIVE_PANE.file_sel].selected ^= 1;
-            if (ACTIVE_PANE.file_sel + 1 < (int)ACTIVE_PANE.list.count) ACTIVE_PANE.file_sel++;
-        }
-        break;
-
-    case '\t': if (CURRENT_TAB.split_mode && !CURRENT_TAB.preview_mode) CURRENT_TAB.active_pane ^= 1; break;
     case KEY_LEFT: if (CURRENT_TAB.split_mode) CURRENT_TAB.active_pane = 0; break;
     case KEY_RIGHT: if (CURRENT_TAB.split_mode && !CURRENT_TAB.preview_mode) CURRENT_TAB.active_pane = 1; break;
     case KEY_HOME: ACTIVE_PANE.file_sel = 0; ACTIVE_PANE.file_top = 0; break;
     case KEY_END: ACTIVE_PANE.file_sel = ACTIVE_PANE.list.count ? (int)ACTIVE_PANE.list.count - 1 : 0; break;
-    case 'j': case KEY_DOWN: if (ACTIVE_PANE.file_sel + 1 < (int)ACTIVE_PANE.list.count) ACTIVE_PANE.file_sel++; break;
-    case 'k': case KEY_UP: if (ACTIVE_PANE.file_sel > 0) ACTIVE_PANE.file_sel--; break;
-    case 'g': ACTIVE_PANE.file_sel = 0; ACTIVE_PANE.file_top = 0; break;
-    case 'G': ACTIVE_PANE.file_sel = ACTIVE_PANE.list.count ? (int)ACTIVE_PANE.list.count - 1 : 0; break;
+    case KEY_DOWN: if (ACTIVE_PANE.file_sel + 1 < (int)ACTIVE_PANE.list.count) ACTIVE_PANE.file_sel++; break;
+    case KEY_UP: if (ACTIVE_PANE.file_sel > 0) ACTIVE_PANE.file_sel--; break;
     case CTRL('d'): case KEY_NPAGE:
         ACTIVE_PANE.file_sel += vis / 2;
         if (ACTIVE_PANE.file_sel >= (int)ACTIVE_PANE.list.count) ACTIVE_PANE.file_sel = ACTIVE_PANE.list.count ? (int)ACTIVE_PANE.list.count - 1 : 0;
@@ -1935,13 +3784,9 @@ static void handle_key(int ch) {
         ACTIVE_PANE.file_sel -= vis / 2;
         if (ACTIVE_PANE.file_sel < 0) ACTIVE_PANE.file_sel = 0;
         break;
-    case '\n': case KEY_ENTER: case 'l':
+    case 127: case KEY_BACKSPACE:
         if (!CURRENT_TAB.preview_mode || CURRENT_TAB.active_pane == 0) action_open(&ACTIVE_PANE);
         break;
-    case 'h': case 127: case KEY_BACKSPACE:
-        if (!CURRENT_TAB.preview_mode || CURRENT_TAB.active_pane == 0) action_open(&ACTIVE_PANE);
-        break;
-    case 'r': action_refresh(&ACTIVE_PANE); break;
     }
 }
 
@@ -1953,10 +3798,16 @@ int main(void) {
     setlocale(LC_ALL, "");
     memset(&g_app, 0, sizeof(g_app));
     g_app.running = 1;
-    
+
     if (!getcwd(g_app.tabs[0].panes[0].cwd, sizeof g_app.tabs[0].panes[0].cwd)) {
         perror("getcwd"); return 1;
     }
+
+    load_config();
+
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+    signal(SIGHUP, sig_handler);
 
     initscr();
     cbreak();
@@ -1965,23 +3816,36 @@ int main(void) {
     curs_set(0);
     init_attributes();
     wbkgd(stdscr, COLOR_PAIR(PAIR_BG));
-    
+
     mousemask(BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_DOUBLE_CLICKED |
               BUTTON3_CLICKED | BUTTON3_PRESSED | BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
 
-    load_session();
-    
     for (int i = 0; i < NUM_TABS; i++) {
         if (g_app.tabs[i].panes[0].cwd[0])
             load_dir(&g_app.tabs[i].panes[0]);
         if (g_app.tabs[i].panes[1].cwd[0])
             load_dir(&g_app.tabs[i].panes[1]);
     }
-    
+
     if (g_app.tabs[0].panes[0].cwd[0] == '\0') {
         load_dir(&g_app.tabs[0].panes[0]);
     }
     g_app.tabs[0].panes[0].file_sel = (g_app.tabs[0].panes[0].list.count > 1) ? 1 : 0;
+
+    for (int i = 0; i < NUM_TABS; i++) {
+        for (int pi = 0; pi < 2; pi++) {
+            FilePane *p = &g_app.tabs[i].panes[pi];
+            if (p->pending_sel[0] && p->list.count > 0) {
+                for (size_t j = 1; j < p->list.count; j++) {
+                    if (strcmp(p->list.items[j].name, p->pending_sel) == 0) {
+                        p->file_sel = (int)j;
+                        break;
+                    }
+                }
+                p->pending_sel[0] = '\0';
+            }
+        }
+    }
 
     while (g_app.running) {
         int rows, cols;
@@ -2002,13 +3866,17 @@ int main(void) {
         if (ch == KEY_MOUSE) {
             MEVENT ev;
             if (getmouse(&ev) == OK) handle_mouse(ev);
+        } else if (ch == KEY_RESIZE) {
+            clearok(stdscr, TRUE);
+            refresh();
+            continue;
         } else {
             handle_key(ch);
         }
     }
 
-    save_session();
-    
+    save_config();
+
     for (int i = 0; i < NUM_TABS; i++) {
         free_list(&g_app.tabs[i].panes[0].list);
         free_list(&g_app.tabs[i].panes[1].list);
