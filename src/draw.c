@@ -40,12 +40,11 @@ static void draw_tabs(int rows, int cols)
     }
 }
 
-static void build_file_info(FilePane *p, char *out, size_t outsz)
+static void build_file_info(FilePane *p, char *out, size_t outsz, const struct tm *now_tm)
 {
     Entry *e;
     char size_str[32], date_str[32], perm[16];
-    struct tm tmv, now_tm;
-    time_t now;
+    struct tm tmv;
     if (outsz == 0) return;
     out[0] = '\0';
     if (!p || !p->list.items || p->list.count == 0 || p->file_sel < 0
@@ -57,11 +56,10 @@ static void build_file_info(FilePane *p, char *out, size_t outsz)
     }
     if (e->is_dir) snprintf(size_str, sizeof size_str, "DIR");
     else           format_size(size_str, sizeof size_str, e->size);
-    now = time(NULL);
-    localtime_r(&now, &now_tm);
-    strcpy(date_str, "?");
+
+    copy_str(date_str, sizeof date_str, "?");
     if (localtime_r(&e->mtime, &tmv)) {
-        if (tmv.tm_year == now_tm.tm_year)
+        if (tmv.tm_year == now_tm->tm_year)
             strftime(date_str, sizeof date_str, "%m-%d %H:%M", &tmv);
         else
             strftime(date_str, sizeof date_str, "%Y-%m-%d ", &tmv);
@@ -71,44 +69,102 @@ static void build_file_info(FilePane *p, char *out, size_t outsz)
              e->name, size_str, date_str, perm);
 }
 
+/* Возвращает ширину кнопки в символах, не отрисовывая её */
+static int btn_width(const char *name) {
+    int k = binding_key_by_name(name);
+    char kbuf[16], disp[32];
+    key_display_name(k, kbuf, sizeof kbuf);
+    if (kbuf[0] && kbuf[1] == '\0') kbuf[0] = toupper((unsigned char)kbuf[0]);
+    snprintf(disp, sizeof disp, " [%s] ", kbuf);
+    return utf8_strlen(disp);
+}
+
+static void draw_btn(int y, int x, const char *name, int pair) {
+    int k = binding_key_by_name(name);
+    char kbuf[16], disp[32];
+    key_display_name(k, kbuf, sizeof kbuf);
+    if (kbuf[0] && kbuf[1] == '\0') kbuf[0] = toupper((unsigned char)kbuf[0]);
+    snprintf(disp, sizeof disp, " [%s] ", kbuf);
+
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddstr(y, x, disp);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
 static void draw_header(int cols)
 {
     char left[PATH_MAX + 32];
-    int avail;
+    int avail, x;
     size_t bytes;
+
+    /* Фон заголовка */
     attron(A_TITLE);
     mvhline(0, 0, ' ', cols);
-    snprintf(left, sizeof left, " VibeyFile: %s", ACTIVE_PANE.cwd);
-    avail = cols - 18;
-    if (avail < 1) avail = 1;
-    bytes = utf8_prefix_bytes(left, avail);
-    mvaddnstr(0, 0, left, (int)bytes);
-    if (cols >= 16)
-        mvaddstr(0, cols - 16, "[A] [=] [O] [X]");
     attroff(A_TITLE);
+
+    /* Левая часть: кнопка [Q] */
+    x = 1;
+    draw_btn(0, x, "quit", PAIR_BTN_QUIT);
+    g_app.g_btn_x_quit = x;
+    g_app.g_btn_w_quit = btn_width("quit");
+    x += g_app.g_btn_w_quit;
+
+    /* Правая часть: [U] [I] [O] [P] */
+    int rx = cols - 1;
+
+    g_app.g_btn_w_book = btn_width("bookmarks");
+    rx -= g_app.g_btn_w_book;
+    g_app.g_btn_x_book = rx;
+
+    g_app.g_btn_w_set = btn_width("settings");
+    rx -= g_app.g_btn_w_set;
+    g_app.g_btn_x_set = rx;
+
+    g_app.g_btn_w_help = btn_width("help");
+    rx -= g_app.g_btn_w_help;
+    g_app.g_btn_x_help = rx;
+
+    g_app.g_btn_w_menu = btn_width("menu");
+    rx -= g_app.g_btn_w_menu;
+    g_app.g_btn_x_menu = rx;
+
+    draw_btn(0, g_app.g_btn_x_book, "bookmarks", PAIR_BTN_BOOKMARKS);
+    draw_btn(0, g_app.g_btn_x_set,  "settings", PAIR_BTN_SETTINGS);
+    draw_btn(0, g_app.g_btn_x_help, "help", PAIR_BTN_HELP);
+    draw_btn(0, g_app.g_btn_x_menu, "menu", PAIR_BTN_MENU);
+
+    /* Заголовок (только путь) между кнопками */
+    avail = rx - x;
+    if (avail > 2) {
+        attron(A_TITLE);
+        snprintf(left, sizeof left, "%s", ACTIVE_PANE.cwd);
+        bytes = utf8_prefix_bytes(left, avail - 2);
+        mvaddnstr(0, x + 1, left, (int)bytes);
+        attroff(A_TITLE);
+    }
 }
 
-static void draw_split(int cols, int rows)
+static void draw_split(int cols, int rows, const struct tm *now_tm)
 {
     int half = cols / 2;
     int pw0 = half, pw1 = cols - half - 1;
     int y;
     if (pw1 < 1) pw1 = 1;
     draw_pane(&CURRENT_TAB.panes[0], 0, 0, pw0, CURRENT_TAB.active_pane == 0,
-              pw0 >= COL_TYPE_MIN, pw0 >= COL_DATE_MIN, pw0 >= COL_SIZE_MIN);
+              pw0 >= COL_TYPE_MIN, pw0 >= COL_DATE_MIN, pw0 >= COL_SIZE_MIN, now_tm);
     if (CURRENT_TAB.preview_mode)
         draw_preview_main(half + 1, pw1, rows);
     else
         draw_pane(&CURRENT_TAB.panes[1], 1, half + 1, pw1,
                   CURRENT_TAB.active_pane == 1,
                   pw1 >= COL_TYPE_MIN, pw1 >= COL_DATE_MIN,
-                  pw1 >= COL_SIZE_MIN);
+                  pw1 >= COL_SIZE_MIN, now_tm);
     attron(A_TITLE);
     for (y = 1; y < rows - 2; y++) mvaddch(y, half, ACS_VLINE);
     attroff(A_TITLE);
 }
 
-static void draw_status_line(int rows, int cols)
+static void draw_status_line(int rows, int cols, const struct tm *now_tm)
 {
     char file_info[1024];
     const char *left_text;
@@ -145,7 +201,7 @@ static void draw_status_line(int rows, int cols)
 
         if (g_app.last_action[0]) left_text = g_app.last_action;
         else {
-            build_file_info(&ACTIVE_PANE, file_info, sizeof file_info);
+            build_file_info(&ACTIVE_PANE, file_info, sizeof file_info, now_tm);
             left_text = file_info;
         }
         bytes = utf8_prefix_bytes(left_text, avail);
@@ -163,14 +219,19 @@ void draw(void)
     normalize_view();
     getmaxyx(stdscr, rows, cols);
     erase();
+
+    time_t now = time(NULL);
+    struct tm now_tm;
+    localtime_r(&now, &now_tm);
+
     draw_header(cols);
     if (CURRENT_TAB.split_mode)
-        draw_split(cols, rows);
+        draw_split(cols, rows, &now_tm);
     else
         draw_pane(&ACTIVE_PANE, CURRENT_TAB.active_pane, 0, cols, 1,
                   cols >= COL_TYPE_MIN, cols >= COL_DATE_MIN,
-                  cols >= COL_SIZE_MIN);
-    draw_status_line(rows, cols);
+                  cols >= COL_SIZE_MIN, &now_tm);
+    draw_status_line(rows, cols, &now_tm);
     draw_tabs(rows, cols);
     refresh();
 }

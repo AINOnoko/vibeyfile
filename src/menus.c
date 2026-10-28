@@ -14,21 +14,25 @@ int run_submenu(const char *title, const char **options, int count)
     if (!title || !options || count <= 0) return -1;
     max_len = utf8_strlen(title);
     int start_x, start_y, sel = 0, ch, res = -1, running = 1;
-    WINDOW *win;
+    WINDOW *win = NULL;
+
     for (i = 0; i < count; i++) {
         int len = utf8_strlen(options[i]);
         if (len > max_len) max_len = len;
     }
-    menu_w = max_len + 6; menu_h = count + 2;
+
     getmaxyx(stdscr, rows, cols);
+    menu_w = max_len + 6; menu_h = count + 2;
     start_x = (cols - menu_w) / 2; start_y = (rows - menu_h) / 2;
-    apply_shadow(start_y, start_x, menu_h, menu_w);
-    win = newwin(menu_h, menu_w, start_y, start_x);
-    if (!win) return -1;
-    wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
-    ui_prepare_win(win);
-    box(win, 0, 0);
+
     while (running && g_app.running) {
+        if (!win) {
+            apply_shadow(start_y, start_x, menu_h, menu_w);
+            win = newwin(menu_h, menu_w, start_y, start_x);
+            if (!win) return -1;
+            wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+            ui_prepare_win(win);
+        }
         werase(win);
         box(win, 0, 0);
         wattron(win, A_HEADER_GRAY);
@@ -43,14 +47,36 @@ int run_submenu(const char *title, const char **options, int count)
             wattroff(win, attr);
         }
         wrefresh(win);
-        ch = get_key(0);
+        ch = get_mapped_key(win);
+        if (ch == KEY_RESIZE) {
+            delwin(win); win = NULL;
+            getmaxyx(stdscr, rows, cols);
+            start_x = (cols - menu_w) / 2; start_y = (rows - menu_h) / 2;
+            continue;
+        }
+        if (ch == KEY_MOUSE) {
+            MEVENT ev;
+            if (getmouse(&ev) == OK) {
+                if (ev.bstate & BUTTON1_CLICKED) {
+                    if (ev.x < start_x || ev.x >= start_x + menu_w || ev.y < start_y || ev.y >= start_y + menu_h) {
+                        running = 0;
+                    }
+                } else if (ev.bstate & BUTTON4_PRESSED) {
+                    sel = (sel - 1 + count) % count;
+                } else if (ev.bstate & BUTTON5_PRESSED) {
+                    sel = (sel + 1) % count;
+                }
+            }
+            continue;
+        }
         if (ch == ERR) continue;
         if (ch == 27) running = 0;
         else if (ch == KEY_DOWN || ch == 'j') sel = (sel + 1) % count;
         else if (ch == KEY_UP || ch == 'k') sel = (sel - 1 + count) % count;
         else if (ch == '\n' || ch == KEY_ENTER) { res = sel; running = 0; }
     }
-    delwin(win); touchwin(stdscr); refresh();
+    if (win) delwin(win);
+    touchwin(stdscr); refresh();
     return res;
 }
 
@@ -76,8 +102,7 @@ static void draw_menu_strip(WINDOW *win, int menu_w, int scroll, int sel,
         int bar_x = menu_w - 2, bar_h = vis, j;
         int thumb_h = (bar_h * vis) / ACT_COUNT;
         int max_scroll = ACT_COUNT - vis;
-        int thumb_pos = max_scroll > 0 ? (bar_h - thumb_h) * scroll
-                          / max_scroll : 0;
+        int thumb_pos = max_scroll > 0 ? (bar_h - thumb_h) * scroll / max_scroll : 0;
         if (thumb_h < 1) thumb_h = 1;
         if (thumb_pos + thumb_h > bar_h) thumb_pos = bar_h - thumb_h;
         for (j = 0; j < bar_h; j++) {
@@ -100,7 +125,8 @@ int run_menu(FilePane *p)
     int vis, needs_scroll, menu_w, menu_h, rows, cols, start_x, start_y;
     int sel = 0, scroll = 0, running = 1, res = 1, content_w, ch;
     int close_key;
-    WINDOW *win;
+    WINDOW *win = NULL;
+
     for (i = 0; i < ACT_COUNT; i++) {
         int len = utf8_strlen(ACTION_NAMES[i]);
         if (len > max_len) max_len = len;
@@ -108,7 +134,6 @@ int run_menu(FilePane *p)
     close_key = binding_key_by_name("menu");
 
     getmaxyx(stdscr, rows, cols);
-    /* Меню занимает до 64% высоты экрана (но не больше числа пунктов). */
     {
         int max_h = (rows * 64) / 100;
         if (max_h < 6) max_h = 6;
@@ -121,34 +146,65 @@ int run_menu(FilePane *p)
     menu_w = max_len + 6 + (needs_scroll ? 1 : 0);
     menu_h = vis + 2;
     start_x = (cols - menu_w) / 2; start_y = (rows - menu_h) / 2;
-    apply_shadow(start_y, start_x, menu_h, menu_w);
-    win = newwin(menu_h, menu_w, start_y, start_x);
-    if (!win) return 1;
-    wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
-    ui_prepare_win(win);
-    box(win, 0, 0);
     content_w = menu_w - 2 - (needs_scroll ? 1 : 0);
+
     while (running && g_app.running) {
+        if (!win) {
+            apply_shadow(start_y, start_x, menu_h, menu_w);
+            win = newwin(menu_h, menu_w, start_y, start_x);
+            if (!win) return 1;
+            wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+            ui_prepare_win(win);
+        }
         werase(win);
         box(win, 0, 0);
         if (sel < scroll) scroll = sel;
         if (sel >= scroll + vis) scroll = sel - vis + 1;
-        draw_menu_strip(win, menu_w, scroll, sel, vis, needs_scroll,
-                        content_w);
+        draw_menu_strip(win, menu_w, scroll, sel, vis, needs_scroll, content_w);
         wrefresh(win);
-        ch = get_key(0);
+        ch = get_mapped_key(win);
+        if (ch == KEY_RESIZE) {
+            delwin(win); win = NULL;
+            getmaxyx(stdscr, rows, cols);
+            {
+                int max_h = (rows * 64) / 100;
+                if (max_h < 6) max_h = 6;
+                vis = max_h - 2;
+            }
+            if (vis > ACT_COUNT) vis = ACT_COUNT;
+            if (vis < 3) vis = 3;
+            needs_scroll = (ACT_COUNT > vis);
+            menu_h = vis + 2;
+            start_x = (cols - menu_w) / 2; start_y = (rows - menu_h) / 2;
+            content_w = menu_w - 2 - (needs_scroll ? 1 : 0);
+            continue;
+        }
+        if (ch == KEY_MOUSE) {
+            MEVENT ev;
+            if (getmouse(&ev) == OK) {
+                if (ev.bstate & BUTTON1_CLICKED) {
+                    if (ev.x < start_x || ev.x >= start_x + menu_w || ev.y < start_y || ev.y >= start_y + menu_h) {
+                        running = 0;
+                    }
+                } else if (ev.bstate & BUTTON4_PRESSED) {
+                    sel = (sel - 1 + ACT_COUNT) % ACT_COUNT;
+                } else if (ev.bstate & BUTTON5_PRESSED) {
+                    sel = (sel + 1) % ACT_COUNT;
+                }
+            }
+            continue;
+        }
         if (ch == ERR) continue;
-        if (ch == 27 || ch == 'q' || (close_key && ch == close_key))
-            running = 0;
+        if (ch == 27 || ch == 'q' || (close_key && ch == close_key)) running = 0;
         else if (ch == KEY_DOWN || ch == 'j') sel = (sel + 1) % ACT_COUNT;
-        else if (ch == KEY_UP || ch == 'k')
-            sel = (sel - 1 + ACT_COUNT) % ACT_COUNT;
+        else if (ch == KEY_UP || ch == 'k') sel = (sel - 1 + ACT_COUNT) % ACT_COUNT;
         else if (ch == '\n' || ch == KEY_ENTER) {
             res = execute_action(sel, p);
             running = 0;
         }
     }
-    delwin(win); touchwin(stdscr); refresh();
+    if (win) delwin(win);
+    touchwin(stdscr); refresh();
     return res;
 }
 
@@ -168,8 +224,20 @@ static void open_bookmark(const char *path)
     }
 }
 
-static void bookmarks_draw(WINDOW *win, int menu_w, int scroll, int sel,
-                           int vis)
+static void bookmark_label(char *out, size_t outsz, const char *path)
+{
+    char shown[PATH_MAX];
+    if (!out || outsz == 0) return;
+    path_display(shown, sizeof shown, path);
+    out[0] = ' ';
+    if (outsz == 1) {
+        out[0] = '\0';
+        return;
+    }
+    copy_str(out + 1, outsz - 1, shown);
+}
+
+static void bookmarks_draw(WINDOW *win, int menu_w, int scroll, int sel, int vis)
 {
     int i;
     wattron(win, A_HEADER_GRAY);
@@ -184,19 +252,34 @@ static void bookmarks_draw(WINDOW *win, int menu_w, int scroll, int sel,
         attr = (idx == sel) ? A_MENU_SEL : A_MENU_NORMAL;
         wattron(win, attr);
         mvwhline(win, 1 + i, 1, ' ', menu_w - 2);
-        snprintf(disp, sizeof disp, " %s", g_app.bookmarks[idx]);
-        mvwaddnstr(win, 1 + i, 1, disp,
-                   (int)utf8_prefix_bytes(disp, menu_w - 2));
+        bookmark_label(disp, sizeof disp, g_app.bookmarks[idx]);
+        mvwaddnstr(win, 1 + i, 1, disp, (int)utf8_prefix_bytes(disp, menu_w - 2));
         wattroff(win, attr);
     }
+}
+
+static int bookmarks_menu_width(void)
+{
+    int max_len = 10, i, menu_w;
+    char shown[PATH_MAX];
+    for (i = 0; i < g_app.bookmark_count; i++) {
+        int len;
+        path_display(shown, sizeof shown, g_app.bookmarks[i]);
+        len = utf8_strlen(shown);
+        if (len > max_len) max_len = len;
+    }
+    menu_w = max_len + 6;
+    if (menu_w > 60) menu_w = 60;
+    return menu_w;
 }
 
 static void bookmarks_delete(int sel)
 {
     char msg[PATH_MAX + 64];
+    char shown[PATH_MAX];
     int i;
-    snprintf(msg, sizeof msg, "Удалить закладку %.100s?",
-             g_app.bookmarks[sel]);
+    path_display(shown, sizeof shown, g_app.bookmarks[sel]);
+    snprintf(msg, sizeof msg, "Удалить закладку %.100s?", shown);
     if (!dialog_confirm("Удаление", msg)) return;
     for (i = sel; i < g_app.bookmark_count - 1; i++)
         copy_str(g_app.bookmarks[i], PATH_MAX, g_app.bookmarks[i + 1]);
@@ -206,56 +289,76 @@ static void bookmarks_delete(int sel)
 
 void run_bookmarks_menu(void)
 {
-    int max_len = 10, i, menu_w, menu_h, rows, cols, start_x, start_y;
+    int menu_w, menu_h, rows, cols, start_x, start_y;
     int sel = 0, ch, running = 1, scroll = 0, vis;
     int close_key;
-    WINDOW *win;
+    WINDOW *win = NULL;
+
     if (g_app.bookmark_count == 0) {
         message_box("Избранное", "Список пуст");
         return;
     }
     close_key = binding_key_by_name("bookmarks");
-    for (i = 0; i < g_app.bookmark_count; i++) {
-        int len = utf8_strlen(g_app.bookmarks[i]);
-        if (len > max_len) max_len = len;
-    }
-    menu_w = max_len + 6; if (menu_w > 60) menu_w = 60;
+    menu_w = bookmarks_menu_width();
     menu_h = g_app.bookmark_count + 2; if (menu_h > 20) menu_h = 20;
+
     getmaxyx(stdscr, rows, cols);
     start_x = (cols - menu_w) / 2; start_y = (rows - menu_h) / 2;
-    apply_shadow(start_y, start_x, menu_h, menu_w);
-    win = newwin(menu_h, menu_w, start_y, start_x);
-    if (!win) return;
-    wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
-    ui_prepare_win(win);
-    box(win, 0, 0);
     vis = menu_h - 2;
+
     while (running && g_app.running) {
+        if (!win) {
+            apply_shadow(start_y, start_x, menu_h, menu_w);
+            win = newwin(menu_h, menu_w, start_y, start_x);
+            if (!win) return;
+            wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+            ui_prepare_win(win);
+        }
         werase(win);
         box(win, 0, 0);
         if (sel < scroll) scroll = sel;
         if (sel >= scroll + vis) scroll = sel - vis + 1;
         bookmarks_draw(win, menu_w, scroll, sel, vis);
         wrefresh(win);
-        ch = get_key(0);
+        ch = get_mapped_key(win);
+        if (ch == KEY_RESIZE) {
+            delwin(win); win = NULL;
+            getmaxyx(stdscr, rows, cols);
+            menu_h = g_app.bookmark_count + 2; if (menu_h > 20) menu_h = 20;
+            start_x = (cols - menu_w) / 2; start_y = (rows - menu_h) / 2;
+            vis = menu_h - 2;
+            continue;
+        }
+        if (ch == KEY_MOUSE) {
+            MEVENT ev;
+            if (getmouse(&ev) == OK) {
+                if (ev.bstate & BUTTON1_CLICKED) {
+                    if (ev.x < start_x || ev.x >= start_x + menu_w || ev.y < start_y || ev.y >= start_y + menu_h) {
+                        running = 0;
+                    }
+                } else if (ev.bstate & BUTTON4_PRESSED) {
+                    sel = (sel - 1 + g_app.bookmark_count) % g_app.bookmark_count;
+                } else if (ev.bstate & BUTTON5_PRESSED) {
+                    sel = (sel + 1) % g_app.bookmark_count;
+                }
+            }
+            continue;
+        }
         if (ch == ERR) continue;
-        if (ch == 27 || ch == 'q' || (close_key && ch == close_key))
-            running = 0;
-        else if (ch == KEY_DOWN || ch == 'j')
-            sel = (sel + 1) % g_app.bookmark_count;
-        else if (ch == KEY_UP || ch == 'k')
-            sel = (sel - 1 + g_app.bookmark_count) % g_app.bookmark_count;
+        if (ch == 27 || ch == 'q' || (close_key && ch == close_key)) running = 0;
+        else if (ch == KEY_DOWN || ch == 'j') sel = (sel + 1) % g_app.bookmark_count;
+        else if (ch == KEY_UP || ch == 'k') sel = (sel - 1 + g_app.bookmark_count) % g_app.bookmark_count;
         else if (ch == '\n' || ch == KEY_ENTER) {
             open_bookmark(g_app.bookmarks[sel]); running = 0;
         } else if (ch == 'd' || ch == 'D') {
             bookmarks_delete(sel);
             if (g_app.bookmark_count == 0) running = 0;
-            else if (sel >= g_app.bookmark_count)
-                sel = g_app.bookmark_count - 1;
+            else if (sel >= g_app.bookmark_count) sel = g_app.bookmark_count - 1;
             werase(stdscr); refresh();
         }
     }
-    delwin(win); touchwin(stdscr); refresh();
+    if (win) delwin(win);
+    touchwin(stdscr); refresh();
 }
 
 /* ==== Settings ==== */
@@ -264,31 +367,7 @@ enum { SK_HEADER, SK_EMPTY, SK_RESET, SK_THEME, SK_BIND, SK_ASSOC, SK_ADD };
 
 typedef struct { int kind; int id; char label[128]; } SettingItem;
 
-static void binding_key_to_input(int k, char *out, size_t outsz)
-{
-    if (k == '\n')      snprintf(out, outsz, "\\n");
-    else if (k == '\t') snprintf(out, outsz, "\\t");
-    else if (k == ' ')  snprintf(out, outsz, "\\s");
-    else if (k == 27)   snprintf(out, outsz, "\\e");
-    else if (k >= 32 && k < 127) { out[0] = (char)k; out[1] = '\0'; }
-    else                snprintf(out, outsz, "?");
-}
 
-static int binding_input_to_key(const char *s)
-{
-    if (s[0] == '\\') {
-        if (s[1] == 'n') return '\n';
-        if (s[1] == 't') return '\t';
-        if (s[1] == 's') return ' ';
-        if (s[1] == 'e') return 27;
-        return 0;
-    }
-    {
-        unsigned char c = (unsigned char)s[0];
-        if (c >= 32 && c < 127) return c;
-    }
-    return 0;
-}
 
 static int find_binding_by_key(int key, int exclude_idx)
 {
@@ -299,8 +378,7 @@ static int find_binding_by_key(int key, int exclude_idx)
     return -1;
 }
 
-static void add_item(SettingItem *it, int *n, int kind, int id,
-                     const char *label)
+static void add_item(SettingItem *it, int *n, int kind, int id, const char *label)
 {
     if (*n >= 256) return;
     it[*n].kind = kind;
@@ -337,8 +415,7 @@ static void build_settings_items(SettingItem *items, int *count_out)
     *count_out = n;
 }
 
-static void settings_draw_item(WINDOW *win, SettingItem *it, int row,
-                               int w, int is_sel)
+static void settings_draw_item(WINDOW *win, SettingItem *it, int row, int w, int is_sel)
 {
     int attr = is_sel ? A_MENU_SEL : A_MENU_NORMAL;
     if (it->kind == SK_HEADER) {
@@ -361,8 +438,7 @@ static void settings_draw_item(WINDOW *win, SettingItem *it, int row,
         key_display_name(g_app.bindings[it->id].key, kbuf, sizeof kbuf);
         mvwprintw(win, row, 2, " %-20s [%s]", it->label, kbuf);
     } else if (it->kind == SK_ASSOC)
-        mvwprintw(win, row, 2, " %-20s [%s]", it->label,
-                  g_app.associations[it->id].cmd);
+        mvwprintw(win, row, 2, " %-20s [%s]", it->label, g_app.associations[it->id].cmd);
     else if (it->kind == SK_ADD)
         mvwprintw(win, row, 2, " [ %s ]", it->label);
     wattroff(win, attr);
@@ -384,8 +460,7 @@ static void settings_draw(WINDOW *win, SettingItem *items, int count,
         int bar_x = w - 2, bar_h = h - 3, j;
         int thumb_h = (bar_h * vis) / count;
         int max_scroll = count - vis;
-        int thumb_pos = max_scroll > 0 ? (bar_h - thumb_h) * scroll
-                          / max_scroll : 0;
+        int thumb_pos = max_scroll > 0 ? (bar_h - thumb_h) * scroll / max_scroll : 0;
         if (thumb_h < 1) thumb_h = 1;
         if (thumb_pos + thumb_h > bar_h) thumb_pos = bar_h - thumb_h;
         for (j = 0; j < bar_h; j++)
@@ -399,8 +474,7 @@ static void settings_draw(WINDOW *win, SettingItem *items, int count,
                 wattroff(win, A_MENU_NORMAL);
             }
     }
-    mvwprintw(win, h - 2, 2,
-              "j/k, Enter, d, Esc/O - выход");
+    mvwprintw(win, h - 2, 2, "j/k, Enter, d, Esc/O - выход");
     wrefresh(win);
 }
 
@@ -452,27 +526,45 @@ static void edit_theme(int idx)
     refresh();
 }
 
+static int capture_binding_key(int *out)
+{
+    WINDOW *win;
+    int rows, cols, w, h, y, x, ch;
+    getmaxyx(stdscr, rows, cols);
+    w = cols > 52 ? 46 : (cols > 8 ? cols - 4 : cols);
+    h = 5;
+    y = (rows - h) / 2;
+    x = (cols - w) / 2;
+    if (y < 0) y = 0;
+    if (x < 0) x = 0;
+    win = newwin(h, w, y, x);
+    if (!win) return 0;
+    wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+    ui_prepare_win(win);
+    box(win, 0, 0);
+    mvwaddn_utf8(win, 1, 2, "Нажмите клавишу", w - 4);
+    mvwaddn_utf8(win, 2, 2, "Esc — отмена", w - 4);
+    wrefresh(win);
+    ch = get_mapped_key(win);
+    delwin(win);
+    touchwin(stdscr);
+    refresh();
+    if (ch == ERR || ch == 27) return 0;
+    *out = ch;
+    return 1;
+}
+
 static void edit_binding(int idx)
 {
-    char buf[16];
     char msg[256];
     char kname[16];
     int nk, conflict;
-    binding_key_to_input(g_app.bindings[idx].key, buf, sizeof buf);
-    if (!dialog_input("Бинд", "\\n, \\t, \\s, \\e или символ:",
-                      buf, sizeof buf)) return;
-    nk = binding_input_to_key(buf);
-    if (!nk) {
-        message_box("Ошибка", "Некорректная клавиша");
-        return;
-    }
+    if (!capture_binding_key(&nk)) return;
     if (nk == g_app.bindings[idx].key) return;
     conflict = find_binding_by_key(nk, idx);
     if (conflict >= 0) {
         key_display_name(nk, kname, sizeof kname);
-        snprintf(msg, sizeof msg,
-                 "Клавиша '%s' уже назначена на «%.80s»",
-                 kname, g_app.bindings[conflict].name);
+        snprintf(msg, sizeof msg, "Клавиша '%s' уже назначена на «%.80s»", kname, g_app.bindings[conflict].name);
         message_box("Конфликт бинда", msg);
         return;
     }
@@ -495,14 +587,12 @@ static void add_assoc(void)
     char ext[64] = "", cmd[PATH_MAX] = "xdg-open";
     char *p;
     if (g_app.assoc_count >= MAX_ASSOC) return;
-    if (!dialog_input("Новая ассоциация", "Расширение:", ext, sizeof ext))
-        return;
+    if (!dialog_input("Новая ассоциация", "Расширение:", ext, sizeof ext)) return;
     p = ext;
     while (*p == '.') p++;
     while (*p == ' ' || *p == '\t') p++;
     if (!*p) return;
-    if (!dialog_input("Новая ассоциация", "Программа:", cmd, sizeof cmd))
-        return;
+    if (!dialog_input("Новая ассоциация", "Программа:", cmd, sizeof cmd)) return;
     if (!cmd[0] || !name_ok(p)) return;
     copy_str(g_app.associations[g_app.assoc_count].ext, 32, p);
     copy_str(g_app.associations[g_app.assoc_count].cmd, PATH_MAX, cmd);
@@ -552,22 +642,25 @@ void run_settings_menu(void)
     int i, count;
     int close_key;
     SettingItem items[256];
-    WINDOW *win;
+    WINDOW *win = NULL;
+
     getmaxyx(stdscr, rows, cols);
     h = (rows * 64) / 100; if (h > rows - 4) h = rows - 4; if (h < 12) h = 12;
     w = 76; if (w > cols * 80 / 100) w = cols * 80 / 100;
     if (w > cols - 4) w = cols - 4;
     if (w < 50) w = 50;
     y = (rows - h) / 2; x = (cols - w) / 2;
-    apply_shadow(y, x, h, w);
-    win = newwin(h, w, y, x);
-    if (!win) return;
-    wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
-    ui_prepare_win(win);
-    box(win, 0, 0);
     vis = h - 4 > 0 ? h - 4 : 1;
     close_key = binding_key_by_name("settings");
+
     while (running && g_app.running) {
+        if (!win) {
+            apply_shadow(y, x, h, w);
+            win = newwin(h, w, y, x);
+            if (!win) return;
+            wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
+            ui_prepare_win(win);
+        }
         build_settings_items(items, &count);
         if (sel >= count) sel = count - 1;
         while (sel < count && !is_selectable(items[sel].kind)) sel++;
@@ -577,17 +670,40 @@ void run_settings_menu(void)
         if (sel >= scroll + vis) scroll = sel - vis + 1;
         if (scroll < 0) scroll = 0;
         settings_draw(win, items, count, scroll, sel, vis, h, w);
-        int ch = wgetch(win);
+        int ch = get_mapped_key(win);
+        if (ch == KEY_RESIZE) {
+            delwin(win); win = NULL;
+            getmaxyx(stdscr, rows, cols);
+            h = (rows * 64) / 100; if (h > rows - 4) h = rows - 4; if (h < 12) h = 12;
+            w = 76; if (w > cols * 80 / 100) w = cols * 80 / 100;
+            if (w > cols - 4) w = cols - 4;
+            if (w < 50) w = 50;
+            y = (rows - h) / 2; x = (cols - w) / 2;
+            vis = h - 4 > 0 ? h - 4 : 1;
+            continue;
+        }
+        if (ch == KEY_MOUSE) {
+            MEVENT ev;
+            if (getmouse(&ev) == OK) {
+                if (ev.bstate & BUTTON1_CLICKED) {
+                    if (ev.x < x || ev.x >= x + w || ev.y < y || ev.y >= y + h) {
+                        running = 0;
+                    }
+                } else if (ev.bstate & BUTTON4_PRESSED) {
+                    sel = move_sel(sel, -1, items, count);
+                } else if (ev.bstate & BUTTON5_PRESSED) {
+                    sel = move_sel(sel, 1, items, count);
+                }
+            }
+            continue;
+        }
         if (ch == ERR) continue;
-        if (ch == 27 || ch == 'q' || (close_key && ch == close_key))
-            running = 0;
-        else if (ch == KEY_DOWN || ch == 'j')
-            sel = move_sel(sel, 1, items, count);
-        else if (ch == KEY_UP || ch == 'k')
-            sel = move_sel(sel, -1, items, count);
-        else if (ch == '\n' || ch == KEY_ENTER)
-            handle_setting_enter(&items[sel]);
+        if (ch == 27 || ch == 'q' || (close_key && ch == close_key)) running = 0;
+        else if (ch == KEY_DOWN || ch == 'j') sel = move_sel(sel, 1, items, count);
+        else if (ch == KEY_UP || ch == 'k') sel = move_sel(sel, -1, items, count);
+        else if (ch == '\n' || ch == KEY_ENTER) handle_setting_enter(&items[sel]);
         else if (ch == 'd' || ch == 'D') delete_assoc(&items[sel]);
     }
-    delwin(win); touchwin(stdscr); refresh();
+    if (win) delwin(win);
+    touchwin(stdscr); refresh();
 }

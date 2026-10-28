@@ -39,6 +39,15 @@ static int utf8_step_at(const char *s, size_t i, size_t len)
     return step;
 }
 
+void mvwaddn_utf8(WINDOW *win, int y, int x, const char *s, int max_chars)
+{
+    size_t n;
+    if (!win || max_chars < 1) return;
+    if (!s) s = "";
+    n = utf8_prefix_bytes(s, max_chars);
+    mvwaddnstr(win, y, x, s, (int)n);
+}
+
 size_t utf8_prefix_bytes(const char *s, int max_chars)
 {
     size_t len, bytes = 0;
@@ -179,85 +188,128 @@ int path_is_inside(const char *parent, const char *child)
     return strncmp(parent, child, n) == 0 && child[n] == '/';
 }
 
-char file_icon(const char *name, int is_dir, mode_t mode)
+static size_t home_prefix_len(const char *home)
+{
+    size_t n;
+    if (!home || home[0] != '/' || !home[1]) return 0;
+    n = strlen(home);
+    while (n > 1 && home[n - 1] == '/') n--;
+    return n;
+}
+
+static int path_under_home(const char *home, size_t n, const char *path)
+{
+    if (!n || !path || strncmp(path, home, n) != 0) return 0;
+    return path[n] == '\0' || path[n] == '/';
+}
+
+static void copy_tilde(char *out, size_t outsz, const char *rest)
+{
+    if (!rest || !rest[0]) {
+        copy_str(out, outsz, "~");
+        return;
+    }
+    if (outsz < 3) {
+        out[0] = '\0';
+        return;
+    }
+    out[0] = '~';
+    out[1] = '/';
+    copy_str(out + 2, outsz - 2, rest);
+}
+
+void path_display(char *out, size_t outsz, const char *path)
+{
+    const char *home = getenv("HOME");
+    size_t n;
+    if (!out || outsz == 0) return;
+    if (!path) path = "";
+    n = home_prefix_len(home);
+    if (!path_under_home(home, n, path)) {
+        copy_str(out, outsz, path);
+        return;
+    }
+    if (path[n] == '/') n++;
+    copy_tilde(out, outsz, path + n);
+}
+
+typedef struct {
+    const char *ext;
+    char icon;
+    const char *kind;
+    int text;
+} ExtInfo;
+
+static const ExtInfo k_exts[] = {
+    {"txt", 'T', "текст", 1}, {"log", 'T', "текст", 1},
+    {"md", 'M', "текст", 1}, {"rst", 0, "текст", 1},
+    {"c", 'C', "код", 1}, {"h", 'C', "код", 1},
+    {"cpp", 'C', "код", 1}, {"cc", 'C', "код", 1}, {"hpp", 'C', "код", 1},
+    {"py", 'P', "код", 1}, {"rs", 'R', "код", 1}, {"go", 'G', "код", 1},
+    {"js", 'J', "код", 1}, {"ts", 'J', "код", 1},
+    {"java", 0, "код", 1}, {"rb", 0, "код", 1},
+    {"json", '{', "конфиг", 1}, {"yaml", 'Y', "конфиг", 1},
+    {"yml", 'Y', "конфиг", 1}, {"toml", 'Y', "конфиг", 1},
+    {"ini", 0, "конфиг", 1}, {"xml", '<', "конфиг", 1},
+    {"sh", '$', "скрипт", 1}, {"bash", '$', "скрипт", 1},
+    {"zsh", '$', "скрипт", 1}, {"fish", 0, "скрипт", 1},
+    {"html", 'W', "веб", 0}, {"htm", 'W', "веб", 0},
+    {"css", 'S', "веб", 0}, {"scss", 0, "веб", 0},
+    {"png", 'I', "изобр", 0}, {"jpg", 'I', "изобр", 0},
+    {"jpeg", 'I', "изобр", 0}, {"gif", 'I', "изобр", 0},
+    {"bmp", 'I', "изобр", 0}, {"svg", 'I', "изобр", 0}, {"webp", 0, "изобр", 0},
+    {"mp3", 'A', "аудио", 0}, {"wav", 'A', "аудио", 0},
+    {"flac", 'A', "аудио", 0}, {"ogg", 'A', "аудио", 0},
+    {"mp4", 'V', "видео", 0}, {"mkv", 'V', "видео", 0},
+    {"avi", 'V', "видео", 0}, {"webm", 'V', "видео", 0},
+    {"zip", 'Z', "архив", 0}, {"tar", 'Z', "архив", 0},
+    {"gz", 'Z', "архив", 0}, {"xz", 'Z', "архив", 0},
+    {"bz2", 'Z', "архив", 0}, {"7z", 'Z', "архив", 0},
+    {"pdf", 'F', "PDF", 0},
+};
+
+static const ExtInfo *lookup_ext(const char *name)
 {
     const char *dot;
-    if (!name) return '-';
-    if (is_dir)                     return 'D';
-    if (name[0] == '.')             return '.';
-    if (mode & (S_IXUSR | S_IXGRP | S_IXOTH)) return 'X';
+    size_t i;
+    if (!name) return NULL;
     dot = strrchr(name, '.');
-    if (!dot || dot == name)        return '-';
-    dot++;
-    if (!strcasecmp(dot, "txt") || !strcasecmp(dot, "log")) return 'T';
-    if (!strcasecmp(dot, "c") || !strcasecmp(dot, "h"))     return 'C';
-    if (!strcasecmp(dot, "cpp") || !strcasecmp(dot, "cc")
-        || !strcasecmp(dot, "hpp")) return 'C';
-    if (!strcasecmp(dot, "py"))     return 'P';
-    if (!strcasecmp(dot, "rs"))     return 'R';
-    if (!strcasecmp(dot, "go"))     return 'G';
-    if (!strcasecmp(dot, "js") || !strcasecmp(dot, "ts"))    return 'J';
-    if (!strcasecmp(dot, "html") || !strcasecmp(dot, "htm")) return 'W';
-    if (!strcasecmp(dot, "css"))    return 'S';
-    if (!strcasecmp(dot, "md"))     return 'M';
-    if (!strcasecmp(dot, "json"))   return '{';
-    if (!strcasecmp(dot, "yaml") || !strcasecmp(dot, "yml")
-        || !strcasecmp(dot, "toml")) return 'Y';
-    if (!strcasecmp(dot, "xml"))    return '<';
-    if (!strcasecmp(dot, "sh") || !strcasecmp(dot, "bash")
-        || !strcasecmp(dot, "zsh")) return '$';
-    if (!strcasecmp(dot, "png") || !strcasecmp(dot, "jpg")
-        || !strcasecmp(dot, "jpeg") || !strcasecmp(dot, "gif")
-        || !strcasecmp(dot, "bmp") || !strcasecmp(dot, "svg")) return 'I';
-    if (!strcasecmp(dot, "mp3") || !strcasecmp(dot, "wav")
-        || !strcasecmp(dot, "flac") || !strcasecmp(dot, "ogg")) return 'A';
-    if (!strcasecmp(dot, "mp4") || !strcasecmp(dot, "mkv")
-        || !strcasecmp(dot, "avi") || !strcasecmp(dot, "webm")) return 'V';
-    if (!strcasecmp(dot, "zip") || !strcasecmp(dot, "tar")
-        || !strcasecmp(dot, "gz")  || !strcasecmp(dot, "xz")
-        || !strcasecmp(dot, "bz2") || !strcasecmp(dot, "7z")) return 'Z';
-    if (!strcasecmp(dot, "pdf"))    return 'F';
-    return '-';
+    if (!dot || dot == name || !dot[1]) return NULL;
+    for (i = 0; i < sizeof k_exts / sizeof k_exts[0]; i++)
+        if (!strcasecmp(dot + 1, k_exts[i].ext)) return &k_exts[i];
+    return NULL;
+}
+
+static int mode_exec(mode_t mode)
+{
+    return (mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+}
+
+char file_icon(const char *name, int is_dir, mode_t mode)
+{
+    const ExtInfo *info;
+    if (!name) return '-';
+    if (is_dir) return 'D';
+    if (name[0] == '.') return '.';
+    if (mode_exec(mode)) return 'X';
+    info = lookup_ext(name);
+    return (info && info->icon) ? info->icon : '-';
 }
 
 const char *type_str(const char *name, int is_dir, mode_t mode)
 {
-    const char *dot;
-    int is_exec;
+    const ExtInfo *info;
     if (!name) return "файл";
     if (is_dir) return "папка";
-    is_exec = (mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
-    dot = strrchr(name, '.');
-    if (!dot || dot == name) return is_exec ? "исп" : "файл";
-    dot++;
-    if (!strcasecmp(dot, "txt") || !strcasecmp(dot, "log")
-        || !strcasecmp(dot, "md") || !strcasecmp(dot, "rst")) return "текст";
-    if (!strcasecmp(dot, "c") || !strcasecmp(dot, "h")
-        || !strcasecmp(dot, "cpp") || !strcasecmp(dot, "cc")
-        || !strcasecmp(dot, "hpp") || !strcasecmp(dot, "py")
-        || !strcasecmp(dot, "rs") || !strcasecmp(dot, "go")
-        || !strcasecmp(dot, "js") || !strcasecmp(dot, "ts")
-        || !strcasecmp(dot, "java") || !strcasecmp(dot, "rb")) return "код";
-    if (!strcasecmp(dot, "json") || !strcasecmp(dot, "yaml")
-        || !strcasecmp(dot, "yml") || !strcasecmp(dot, "toml")
-        || !strcasecmp(dot, "ini") || !strcasecmp(dot, "xml")) return "конфиг";
-    if (!strcasecmp(dot, "sh") || !strcasecmp(dot, "bash")
-        || !strcasecmp(dot, "zsh") || !strcasecmp(dot, "fish")) return "скрипт";
-    if (!strcasecmp(dot, "html") || !strcasecmp(dot, "htm")
-        || !strcasecmp(dot, "css") || !strcasecmp(dot, "scss")) return "веб";
-    if (!strcasecmp(dot, "png") || !strcasecmp(dot, "jpg")
-        || !strcasecmp(dot, "jpeg") || !strcasecmp(dot, "gif")
-        || !strcasecmp(dot, "bmp") || !strcasecmp(dot, "svg")
-        || !strcasecmp(dot, "webp")) return "изобр";
-    if (!strcasecmp(dot, "mp3") || !strcasecmp(dot, "wav")
-        || !strcasecmp(dot, "flac") || !strcasecmp(dot, "ogg")) return "аудио";
-    if (!strcasecmp(dot, "mp4") || !strcasecmp(dot, "mkv")
-        || !strcasecmp(dot, "avi") || !strcasecmp(dot, "webm")) return "видео";
-    if (!strcasecmp(dot, "zip") || !strcasecmp(dot, "tar")
-        || !strcasecmp(dot, "gz")  || !strcasecmp(dot, "xz")
-        || !strcasecmp(dot, "bz2") || !strcasecmp(dot, "7z")) return "архив";
-    if (!strcasecmp(dot, "pdf")) return "PDF";
-    return "файл";
+    info = lookup_ext(name);
+    if (info && info->kind) return info->kind;
+    return mode_exec(mode) ? "исп" : "файл";
+}
+
+int is_text_file(const char *name)
+{
+    const ExtInfo *info = lookup_ext(name);
+    return info && info->text;
 }
 
 int binding_key_by_name(const char *name)
@@ -277,6 +329,97 @@ void key_display_name(int key, char *out, size_t outsz)
     else if (key == '\t')            snprintf(out, outsz, "Tab");
     else if (key == ' ')             snprintf(out, outsz, "Space");
     else if (key == 27)              snprintf(out, outsz, "Esc");
+    else if (key >= KEY_F(1) && key <= KEY_F(12))
+        snprintf(out, outsz, "F%d", key - KEY_F(1) + 1);
+    else if (key == KEY_UP)          snprintf(out, outsz, "Up");
+    else if (key == KEY_DOWN)        snprintf(out, outsz, "Down");
+    else if (key == KEY_LEFT)        snprintf(out, outsz, "Left");
+    else if (key == KEY_RIGHT)       snprintf(out, outsz, "Right");
+    else if (key == KEY_HOME)        snprintf(out, outsz, "Home");
+    else if (key == KEY_END)         snprintf(out, outsz, "End");
+    else if (key == KEY_PPAGE)       snprintf(out, outsz, "PgUp");
+    else if (key == KEY_NPAGE)       snprintf(out, outsz, "PgDn");
     else if (key >= 32 && key < 127) { out[0] = (char)key; out[1] = '\0'; }
     else                             snprintf(out, outsz, "?");
+}
+
+static int named_key_code(const char *s)
+{
+    static const struct { const char *name; int key; } tab[] = {
+        { "UP", KEY_UP }, { "DOWN", KEY_DOWN },
+        { "LEFT", KEY_LEFT }, { "RIGHT", KEY_RIGHT },
+        { "HOME", KEY_HOME }, { "END", KEY_END },
+        { "PGUP", KEY_PPAGE }, { "PGDN", KEY_NPAGE },
+        { "BS", KEY_BACKSPACE }, { "DEL", KEY_DC },
+    };
+    size_t i;
+    if (s[0] == 'F') {
+        int n = 0;
+        const char *p = s + 1;
+        if (*p < '1' || *p > '9') return 0;
+        while (*p >= '0' && *p <= '9') n = n * 10 + (*p++ - '0');
+        if (*p == '\0' && n >= 1 && n <= 12) return KEY_F(n);
+    }
+    for (i = 0; i < sizeof tab / sizeof tab[0]; i++)
+        if (!strcmp(s, tab[i].name)) return tab[i].key;
+    return 0;
+}
+
+static const char *named_key_str(int key)
+{
+    if (key == KEY_UP) return "UP";
+    if (key == KEY_DOWN) return "DOWN";
+    if (key == KEY_LEFT) return "LEFT";
+    if (key == KEY_RIGHT) return "RIGHT";
+    if (key == KEY_HOME) return "HOME";
+    if (key == KEY_END) return "END";
+    if (key == KEY_PPAGE) return "PGUP";
+    if (key == KEY_NPAGE) return "PGDN";
+    if (key == KEY_BACKSPACE) return "BS";
+    if (key == KEY_DC) return "DEL";
+    return NULL;
+}
+
+int binding_str_to_key(const char *s)
+{
+    int named;
+    if (!s || !s[0]) return 0;
+    named = named_key_code(s);
+    if (named) return named;
+    if (s[0] == '\\' && s[1] == 'n') return '\n';
+    if (s[0] == '\\' && s[1] == 't') return '\t';
+    if (s[0] == '\\' && s[1] == 's') return ' ';
+    if (s[0] == '\\' && s[1] == 'e') return 27;
+    if ((unsigned char)s[0] >= 32 && (unsigned char)s[0] < 127)
+        return (unsigned char)s[0];
+    return 0;
+}
+
+void binding_key_to_str(int key, char *out, size_t outsz)
+{
+    const char *named;
+    if (!out || outsz == 0) return;
+    if (key >= KEY_F(1) && key <= KEY_F(12)) {
+        snprintf(out, outsz, "F%d", key - KEY_F(1) + 1);
+        return;
+    }
+    named = named_key_str(key);
+    if (named) { snprintf(out, outsz, "%s", named); return; }
+    if (key == '\n')                 snprintf(out, outsz, "\\n");
+    else if (key == '\t')            snprintf(out, outsz, "\\t");
+    else if (key == ' ')             snprintf(out, outsz, "\\s");
+    else if (key == 27)              snprintf(out, outsz, "\\e");
+    else if (key >= 32 && key < 127) { out[0] = (char)key; out[1] = '\0'; }
+    else                             snprintf(out, outsz, "?");
+}
+
+char (*alloc_paths(int n))[PATH_MAX]
+{
+    if (n <= 0) return NULL;
+    return calloc((size_t)n, sizeof(char[PATH_MAX]));
+}
+
+void free_paths(char (*p)[PATH_MAX])
+{
+    free(p);
 }

@@ -69,17 +69,15 @@ static int row_attr(FilePane *p, Entry *e, int idx, int is_active)
 }
 
 static void entry_date_size(Entry *e, char *date_str, char *size_str,
-                            size_t dsz, size_t ssz)
+                            size_t dsz, size_t ssz, const struct tm *now_tm)
 {
-    struct tm tmv, now_tm;
-    time_t now = time(NULL);
-    localtime_r(&now, &now_tm);
+    struct tm tmv;
     if (e->is_parent) {
         snprintf(size_str, ssz, "DIR");
         return;
     }
     if (localtime_r(&e->mtime, &tmv)) {
-        if (tmv.tm_year == now_tm.tm_year)
+        if (tmv.tm_year == now_tm->tm_year)
             strftime(date_str, dsz, "%m-%d %H:%M", &tmv);
         else
             strftime(date_str, dsz, "%Y-%m-%d ", &tmv);
@@ -89,7 +87,7 @@ static void entry_date_size(Entry *e, char *date_str, char *size_str,
 }
 
 static void build_row(char *row, size_t rowsz, FilePane *p, Entry *e,
-                      PaneGeom *g, int idx)
+                      PaneGeom *g, int idx, const struct tm *now_tm)
 {
     char date_str[16] = "-", size_str[16] = "-";
     char name_disp[MAX_NAME + 16];
@@ -98,14 +96,18 @@ static void build_row(char *row, size_t rowsz, FilePane *p, Entry *e,
     char icon, mark_char;
     const char *tname;
     int pos;
+
     entry_date_size(e, date_str, size_str, sizeof date_str,
-                    sizeof size_str);
+                    sizeof size_str, now_tm);
+
     if (e->is_parent)
         snprintf(name_disp, sizeof name_disp, "<--- %s", e->name);
     else
         snprintf(name_disp, sizeof name_disp, "%s", e->name);
-    icon = e->is_parent ? '<' : file_icon(e->name, e->is_dir, e->mode);
-    tname = type_str(e->name, e->is_dir, e->mode);
+
+    icon = e->icon;
+    tname = e->type_name;
+
     build_padded(name_padded, sizeof name_padded, name_disp, g->name_w, 0);
     build_padded(type_padded, sizeof type_padded, tname, TYPE_W, 0);
     build_padded(date_padded, sizeof date_padded, date_str, DATE_W, 0);
@@ -125,7 +127,7 @@ static void build_row(char *row, size_t rowsz, FilePane *p, Entry *e,
 
 static void draw_pane_row(FilePane *p, int x, int y, int w, int idx,
                           int is_active, int show_type, int show_date,
-                          int show_size)
+                          int show_size, const struct tm *now_tm)
 {
     Entry *e = &p->list.items[idx];
     PaneGeom g;
@@ -133,7 +135,7 @@ static void draw_pane_row(FilePane *p, int x, int y, int w, int idx,
     int attr, safe_bytes;
     compute_geometry(x, w, show_type, show_date, show_size, &g);
     attr = row_attr(p, e, idx, is_active);
-    build_row(row, sizeof row, p, e, &g, idx);
+    build_row(row, sizeof row, p, e, &g, idx, now_tm);
     safe_bytes = (int)utf8_prefix_bytes(row, w);
     attron(attr);
     mvhline(y, x, ' ', w);
@@ -167,7 +169,8 @@ static void draw_scrollbar(FilePane *p, int x, int w, int items_y, int vis)
 }
 
 void draw_pane(FilePane *p, int pane_idx, int x, int w, int is_active,
-               int show_type, int show_date, int show_size)
+               int show_type, int show_date, int show_size,
+               const struct tm *now_tm)
 {
     int rows, cols, items_y, vis, needs_scroll, content_w, i;
     getmaxyx(stdscr, rows, cols);
@@ -194,7 +197,7 @@ void draw_pane(FilePane *p, int pane_idx, int x, int w, int is_active,
         int idx = p->file_top + i;
         if (idx >= (int)p->list.count) break;
         draw_pane_row(p, x, items_y + i, content_w, idx, is_active,
-                      show_type, show_date, show_size);
+                      show_type, show_date, show_size, now_tm);
     }
     if (needs_scroll) draw_scrollbar(p, x, w, items_y, vis);
 }

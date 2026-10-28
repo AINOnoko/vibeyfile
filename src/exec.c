@@ -4,13 +4,22 @@ int tokenize_cmd(const char *cmd, char **argv, int max_args)
 {
     char *work, *save = NULL, *tok;
     int n = 0;
-    if (!argv || !cmd || !*cmd || max_args < 2) return 0;
+    if (!argv) return 0;
+
+    argv[0] = NULL;
+
+    if (!cmd || !*cmd || max_args < 2) return 0;
     work = strdup(cmd);
     if (!work) return 0;
     tok = strtok_r(work, " \t\n\r", &save);
     while (tok && n < max_args - 1) {
         argv[n] = strdup(tok);
-        if (!argv[n]) break;
+        if (!argv[n]) {
+            free_argv(argv, n);
+            free(work);
+            argv[0] = NULL;
+            return 0;
+        }
         n++;
         tok = strtok_r(NULL, " \t\n\r", &save);
     }
@@ -48,6 +57,7 @@ void spawn_detached_argv(char *const argv[])
 {
     pid_t pid, pid2;
     int devnull;
+    /* Двойной fork + setsid: внук не остаётся зомби и отвязан от tty. */
     if (!argv || !argv[0]) return;
     pid = fork();
     if (pid < 0) return;
@@ -72,63 +82,91 @@ void spawn_detached_argv(char *const argv[])
         continue;
 }
 
-static void ignore_signal(int sig, struct sigaction *old)
+static const int k_job_sigs[] = {
+    SIGINT, SIGQUIT, SIGTSTP, SIGTTOU, SIGTTIN
+};
+#define JOB_SIG_N ((int)(sizeof k_job_sigs / sizeof k_job_sigs[0]))
+
+static void job_sigs_ignore(struct sigaction saved[])
 {
     struct sigaction ign;
+    int i;
     memset(&ign, 0, sizeof ign);
     ign.sa_handler = SIG_IGN;
     sigemptyset(&ign.sa_mask);
-    sigaction(sig, &ign, old);
+    for (i = 0; i < JOB_SIG_N; i++)
+        sigaction(k_job_sigs[i], &ign, &saved[i]);
 }
 
-int run_foreground(char *const argv[], const char *workdir)
+static void job_sigs_restore(const struct sigaction saved[])
 {
+    int i;
+    for (i = 0; i < JOB_SIG_N; i++)
+        sigaction(k_job_sigs[i], &saved[i], NULL);
+}
+
+static void give_tty(pid_t pid)
+{
+    if (isatty(STDIN_FILENO))
+        tcsetpgrp(STDIN_FILENO, pid);
+}
+
+static int child_result(int status)
+{
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return -2;
+    return -1;
+}
+
+static void resume_tty(int restore_tty)
+{
+    if (!restore_tty) return;
+    reset_prog_mode();
+    refresh();
+}
+
+int spawn_sync(const char *file, char *const argv[], int restore_tty, const char *workdir)
+{
+    struct sigaction saved[JOB_SIG_N];
     pid_t pid;
     int status = 0;
-    struct sigaction old_int, old_term, old_hup, old_quit, old_tstp;
+    const char *bin;
+
     if (!argv || !argv[0]) return -1;
-    ignore_signal(SIGINT, &old_int);
-    ignore_signal(SIGTERM, &old_term);
-    ignore_signal(SIGHUP, &old_hup);
-    ignore_signal(SIGQUIT, &old_quit);
-    ignore_signal(SIGTSTP, &old_tstp);
-    def_prog_mode();
-    endwin();
+    bin = argv[0][0] ? argv[0] : file;
+    if (!bin || !bin[0]) return -1;
+    if (restore_tty) {
+        def_prog_mode();
+        endwin();
+    }
     pid = fork();
     if (pid < 0) {
-        sigaction(SIGINT, &old_int, NULL);
-        sigaction(SIGTERM, &old_term, NULL);
-        sigaction(SIGHUP, &old_hup, NULL);
-        sigaction(SIGQUIT, &old_quit, NULL);
-        sigaction(SIGTSTP, &old_tstp, NULL);
-        reset_prog_mode();
-        refresh();
+        resume_tty(restore_tty);
         return -1;
     }
     if (pid == 0) {
         setpgid(0, 0);
-        if (isatty(STDIN_FILENO))
-            tcsetpgrp(STDIN_FILENO, getpid());
+        give_tty(getpid());
         child_default_signals();
         if (workdir && *workdir && chdir(workdir) != 0) _exit(127);
-        execvp(argv[0], argv);
+        execvp(bin, argv);
         _exit(127);
     }
+    job_sigs_ignore(saved);
     setpgid(pid, pid);
-    if (isatty(STDIN_FILENO))
-        tcsetpgrp(STDIN_FILENO, pid);
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-        continue;
-    if (isatty(STDIN_FILENO))
-        tcsetpgrp(STDIN_FILENO, getpgrp());
-    sigaction(SIGINT, &old_int, NULL);
-    sigaction(SIGTERM, &old_term, NULL);
-    sigaction(SIGHUP, &old_hup, NULL);
-    sigaction(SIGQUIT, &old_quit, NULL);
-    sigaction(SIGTSTP, &old_tstp, NULL);
-    reset_prog_mode();
-    refresh();
-    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+    give_tty(pid);
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            give_tty(getpgrp());
+            job_sigs_restore(saved);
+            resume_tty(restore_tty);
+            return -1;
+        }
+    }
+    give_tty(getpgrp());
+    job_sigs_restore(saved);
+    resume_tty(restore_tty);
+    return child_result(status);
 }
 
 int get_mime_type(const char *path, char *out, size_t outsz)
@@ -147,6 +185,9 @@ int get_mime_type(const char *path, char *out, size_t outsz)
         if (fds[1] > 2) close(fds[1]);
         devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+
+        child_default_signals();
+
         execlp("file", "file", "-b", "--mime-type", "--", path, (char *)NULL);
         _exit(127);
     }
@@ -156,6 +197,14 @@ int get_mime_type(const char *path, char *out, size_t outsz)
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
         total += n;
+    }
+    /* Если буфер забит, дочитываем pipe до EOF, иначе child зависнет на write. */
+    if (total >= (ssize_t)outsz - 1) {
+        char drain[256];
+        ssize_t n;
+        do {
+            n = read(fds[0], drain, sizeof drain);
+        } while (n > 0 || (n < 0 && errno == EINTR));
     }
     close(fds[0]);
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)

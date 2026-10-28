@@ -41,7 +41,7 @@
 #define MAX_BINDINGS 32
 #define VIEW_MAX_SIZE (5 * 1024 * 1024)
 #define MENU_MAX_VIS 16
-#define THEME_FIELDS 22
+#define THEME_FIELDS 32
 #define CALC_SIZE_MAX_DEPTH 100
 #define MAX_ARGS     64
 
@@ -59,7 +59,8 @@ enum {
     PAIR_HEADER, PAIR_TITLE, PAIR_TAB_ACTIVE, PAIR_TAB_INACTIVE,
     PAIR_QUIT, PAIR_QUIT_SEL, PAIR_GRAY_BG, PAIR_MARKED,
     PAIR_BG, PAIR_DIALOG, PAIR_SHADOW, PAIR_STATUS, PAIR_MENU_SEL,
-    PAIR_SCROLL
+    PAIR_SCROLL,
+    PAIR_BTN_QUIT, PAIR_BTN_MENU, PAIR_BTN_HELP, PAIR_BTN_SETTINGS, PAIR_BTN_BOOKMARKS
 };
 
 typedef enum {
@@ -81,6 +82,8 @@ typedef struct {
     mode_t mode;
     off_t  size;
     time_t mtime;
+    char   icon;
+    char   type_name[16];
 } Entry;
 
 typedef struct { Entry *items; size_t count; } EntryList;
@@ -120,7 +123,16 @@ typedef struct {
     int         assoc_count;
     Binding bindings[MAX_BINDINGS];
     int     binding_count;
+
     int g_x_name[2], g_x_type[2], g_x_date[2], g_x_size[2];
+
+    /* Для координат кнопок в шапке */
+    int g_btn_x_quit, g_btn_w_quit;
+    int g_btn_x_menu, g_btn_w_menu;
+    int g_btn_x_help, g_btn_w_help;
+    int g_btn_x_set,  g_btn_w_set;
+    int g_btn_x_book, g_btn_w_book;
+
     int running;
     char last_action[PATH_MAX + 128];
 } AppState;
@@ -145,6 +157,13 @@ typedef struct {
     char tab_inactive_bg[8], tab_inactive_fg[8];
     char status_bg[8], status_fg[8];
     char dialog_bg[8], dialog_fg[8];
+
+    /* Цвета кнопок */
+    char btn_quit_bg[8], btn_quit_fg[8];
+    char btn_menu_bg[8], btn_menu_fg[8];
+    char btn_help_bg[8], btn_help_fg[8];
+    char btn_set_bg[8],  btn_set_fg[8];
+    char btn_book_bg[8], btn_book_fg[8];
 } ThemeConfig;
 
 typedef struct { SortField field; int desc; } SortCtx;
@@ -173,6 +192,7 @@ extern int A_SCROLL_THUMB, A_SCROLL_TRACK;
 void   copy_str(char *dst, size_t dstsz, const char *src);
 int    utf8_strlen(const char *s);
 size_t utf8_prefix_bytes(const char *s, int max_chars);
+void   mvwaddn_utf8(WINDOW *win, int y, int x, const char *s, int max_chars);
 void   build_padded(char *out, size_t outsz, const char *in,
                     int width, int right);
 void   format_size(char *out, size_t outsz, off_t size);
@@ -182,10 +202,15 @@ int    make_path(char *out, size_t outsz, const char *dir,
 int    name_ok(const char *name);
 int    path_parent(char *out, size_t outsz, const char *path);
 int    path_is_inside(const char *parent, const char *child);
+void   path_display(char *out, size_t outsz, const char *path);
 char   file_icon(const char *name, int is_dir, mode_t mode);
 const char *type_str(const char *name, int is_dir, mode_t mode);
 int    binding_key_by_name(const char *name);
 void   key_display_name(int key, char *out, size_t outsz);
+int    binding_str_to_key(const char *s);
+void   binding_key_to_str(int key, char *out, size_t outsz);
+char (*alloc_paths(int n))[PATH_MAX];
+void   free_paths(char (*p)[PATH_MAX]);
 
 /* theme.c */
 void        default_config(void);
@@ -201,6 +226,7 @@ void default_bindings(void);
 void load_config(void);
 void save_config(void);
 void add_bookmark(const char *path);
+void add_home_places(const char *home);
 
 /* fs.c */
 void do_sort(FilePane *p);
@@ -208,7 +234,7 @@ void free_list(EntryList *l);
 int  load_dir(FilePane *p);
 int  enter_dir(const char *path, FilePane *p);
 off_t calc_size(const char *path, int depth);
-int  do_copy_recursive(const char *src, const char *dst, CopyProgress *cp);
+int  do_copy_recursive(const char *src, const char *dst, CopyProgress *cp, int overwrite);
 int  get_selected_or_current(FilePane *p, char paths[][PATH_MAX],
                              int max_paths);
 int  fs_delete(const char *target);
@@ -217,7 +243,8 @@ int  fs_delete(const char *target);
 int  tokenize_cmd(const char *cmd, char **argv, int max_args);
 void free_argv(char **argv, int n);
 void spawn_detached_argv(char *const argv[]);
-int  run_foreground(char *const argv[], const char *workdir);
+/* >=0 — код выхода, -1 — не запустился, -2 — убит сигналом. */
+int  spawn_sync(const char *file, char *const argv[], int restore_tty, const char *workdir);
 int  get_mime_type(const char *path, char *out, size_t outsz);
 
 /* dialog.c */
@@ -235,7 +262,8 @@ void compute_geometry(int x, int w, int show_type, int show_date,
 void draw_pane_header(FilePane *p, int pane_idx, int x, int w,
                       int show_type, int show_date, int show_size);
 void draw_pane(FilePane *p, int pane_idx, int x, int w, int is_active,
-               int show_type, int show_date, int show_size);
+               int show_type, int show_date, int show_size,
+               const struct tm *now_tm);
 
 /* view.c */
 int  is_text_file(const char *name);
@@ -276,10 +304,12 @@ void draw(void);
 
 /* keys.c */
 int  get_key(int raw_mode);
+int  get_mapped_key(WINDOW *win);
 void handle_key(int ch);
 void handle_mouse(MEVENT ev);
 
 /* app.c */
 int  app_run(void);
+void app_poll_signals(void);
 
 #endif

@@ -38,14 +38,33 @@ void default_config(void)
     snprintf(g_theme.header_fg, 8, "#000000");
     snprintf(g_theme.title_bg, 8, "#FFFFFF");
     snprintf(g_theme.title_fg, 8, "#000000");
-    snprintf(g_theme.tab_active_bg, 8, "#55FF55");
-    snprintf(g_theme.tab_active_fg, 8, "#000000");
+
+    /* Активная вкладка: бирюзовый фон, БЕЛЫЙ текст */
+    snprintf(g_theme.tab_active_bg, 8, "#00AAAA");
+    snprintf(g_theme.tab_active_fg, 8, "#FFFFFF");
+
     snprintf(g_theme.tab_inactive_bg, 8, "#000000");
     snprintf(g_theme.tab_inactive_fg, 8, "#FFFFFF");
     snprintf(g_theme.status_bg, 8, "#FFFFFF");
     snprintf(g_theme.status_fg, 8, "#000000");
     snprintf(g_theme.dialog_bg, 8, "#FFFFFF");
     snprintf(g_theme.dialog_fg, 8, "#000000");
+
+    /* Дефолтные цвета кнопок (фон темно-цветной, текст белый) */
+    snprintf(g_theme.btn_quit_bg, 8, "#AA0000"); /* Темно-красный */
+    snprintf(g_theme.btn_quit_fg, 8, "#FFFFFF");
+
+    snprintf(g_theme.btn_menu_bg, 8, "#AA5500"); /* Темно-оранжевый */
+    snprintf(g_theme.btn_menu_fg, 8, "#FFFFFF");
+
+    snprintf(g_theme.btn_help_bg, 8, "#00AA00"); /* Темно-зеленый */
+    snprintf(g_theme.btn_help_fg, 8, "#FFFFFF");
+
+    snprintf(g_theme.btn_set_bg, 8, "#AA00AA");  /* Темно-пурпурный */
+    snprintf(g_theme.btn_set_fg, 8, "#FFFFFF");
+
+    snprintf(g_theme.btn_book_bg, 8, "#00AAAA"); /* Темно-бирюзовый */
+    snprintf(g_theme.btn_book_fg, 8, "#FFFFFF");
 }
 
 int theme_color_ok(const char *hex)
@@ -133,6 +152,17 @@ char *theme_field_by_idx(int idx)
     case 19: return g_theme.status_fg;
     case 20: return g_theme.dialog_bg;
     case 21: return g_theme.dialog_fg;
+
+    case 22: return g_theme.btn_quit_bg;
+    case 23: return g_theme.btn_quit_fg;
+    case 24: return g_theme.btn_menu_bg;
+    case 25: return g_theme.btn_menu_fg;
+    case 26: return g_theme.btn_help_bg;
+    case 27: return g_theme.btn_help_fg;
+    case 28: return g_theme.btn_set_bg;
+    case 29: return g_theme.btn_set_fg;
+    case 30: return g_theme.btn_book_bg;
+    case 31: return g_theme.btn_book_fg;
     }
     return NULL;
 }
@@ -144,7 +174,12 @@ const char *theme_name_by_idx(int idx)
         "marked_bg", "marked_fg", "dir", "exec",
         "header_bg", "header_fg", "title_bg", "title_fg",
         "tab_active_bg", "tab_active_fg", "tab_inactive_bg", "tab_inactive_fg",
-        "status_bg", "status_fg", "dialog_bg", "dialog_fg"
+        "status_bg", "status_fg", "dialog_bg", "dialog_fg",
+        "btn_quit_bg", "btn_quit_fg",
+        "btn_menu_bg", "btn_menu_fg",
+        "btn_help_bg", "btn_help_fg",
+        "btn_set_bg", "btn_set_fg",
+        "btn_book_bg", "btn_book_fg"
     };
     if (idx < 0 || idx >= THEME_FIELDS) return "";
     return names[idx];
@@ -192,6 +227,12 @@ static void init_pairs_from_theme(void)
     init_pair(PAIR_SCROLL,
               theme_color(g_theme.sel_fg),
               theme_color(g_theme.sel_bg));
+
+    init_pair(PAIR_BTN_QUIT, theme_color(g_theme.btn_quit_fg), theme_color(g_theme.btn_quit_bg));
+    init_pair(PAIR_BTN_MENU, theme_color(g_theme.btn_menu_fg), theme_color(g_theme.btn_menu_bg));
+    init_pair(PAIR_BTN_HELP, theme_color(g_theme.btn_help_fg), theme_color(g_theme.btn_help_bg));
+    init_pair(PAIR_BTN_SETTINGS, theme_color(g_theme.btn_set_fg), theme_color(g_theme.btn_set_bg));
+    init_pair(PAIR_BTN_BOOKMARKS, theme_color(g_theme.btn_book_fg), theme_color(g_theme.btn_book_bg));
 }
 
 static void set_attrs_from_pairs(void)

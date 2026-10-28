@@ -1,17 +1,25 @@
 #include "fm.h"
 
+static volatile sig_atomic_t g_stop_req;
+static volatile sig_atomic_t g_tstp_req;
+
 static void sig_handler(int sig)
 {
     (void)sig;
-    g_app.running = 0;
+    g_stop_req = 1;
 }
 
 static void install_tstp(void);
 
 static void sig_tstp(int sig)
 {
-    struct sigaction sa;
     (void)sig;
+    g_tstp_req = 1;
+}
+
+static void suspend_self(void)
+{
+    struct sigaction sa;
     endwin();
     memset(&sa, 0, sizeof sa);
     sigemptyset(&sa.sa_mask);
@@ -20,6 +28,14 @@ static void sig_tstp(int sig)
     raise(SIGTSTP);
     install_tstp();
     refresh();
+}
+
+void app_poll_signals(void)
+{
+    if (g_stop_req) g_app.running = 0;
+    if (!g_tstp_req) return;
+    g_tstp_req = 0;
+    suspend_self();
 }
 
 static void install_tstp(void)

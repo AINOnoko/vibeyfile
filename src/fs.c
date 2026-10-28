@@ -11,8 +11,8 @@ static int cmp_entry_ctx(const void *a, const void *b, void *ctx)
         res = strcoll(ea->name, eb->name);
         if (res == 0) res = strcmp(ea->name, eb->name);
     } else if (c->field == SORT_TYPE) {
-        const char *ta = type_str(ea->name, ea->is_dir, ea->mode);
-        const char *tb = type_str(eb->name, eb->is_dir, eb->mode);
+        const char *ta = ea->type_name;
+        const char *tb = eb->type_name;
         res = strcoll(ta, tb);
         if (res == 0) res = strcmp(ea->name, eb->name);
     } else if (c->field == SORT_DATE) {
@@ -92,6 +92,10 @@ static int append_entry(EntryList *l, size_t *cap, const char *dname,
             it->mtime  = st.st_mtime;
         }
     }
+
+    it->icon = it->is_parent ? '<' : file_icon(it->name, it->is_dir, it->mode);
+    snprintf(it->type_name, sizeof(it->type_name), "%s", type_str(it->name, it->is_dir, it->mode));
+
     l->count++;
     return 0;
 }
@@ -111,6 +115,8 @@ static int read_dir_entries(FilePane *p)
     l.items[0].is_dir    = 1;
     l.items[0].is_parent = 1;
     l.items[0].mode      = S_IFDIR | 0755;
+    l.items[0].icon      = '<';
+    snprintf(l.items[0].type_name, sizeof(l.items[0].type_name), "папка");
     l.count = 1;
     errno = 0;
     while ((de = readdir(d))) {
@@ -172,6 +178,7 @@ int enter_dir(const char *path, FilePane *p)
     char resolved[PATH_MAX];
     char saved[PATH_MAX];
     if (!path || !p) return -1;
+    /* realpath, не chdir: канонический путь без прыжка по symlink, cwd процесса не трогаем. */
     if (!realpath(path, resolved)) return -1;
     copy_str(saved, sizeof saved, p->cwd);
     copy_str(p->cwd, sizeof p->cwd, resolved);
@@ -230,42 +237,117 @@ static void note_progress(CopyProgress *cp, off_t n, const char *disp)
     cp->last_pct = pct;
 }
 
-static int do_copy_file(const char *src, const char *dst, CopyProgress *cp)
+static int dest_exists(const char *dst)
 {
     struct stat st;
-    int in, out, rc = 0;
+    return lstat(dst, &st) == 0;
+}
+
+static int open_sibling_temp(char *tmp, size_t tmpsz, const char *dst)
+{
+    char dir[PATH_MAX];
+    int n, fd;
+    if (path_parent(dir, sizeof dir, dst) != 0)
+        copy_str(dir, sizeof dir, ".");
+    n = snprintf(tmp, tmpsz, "%s/.vibey.XXXXXX", dir);
+    if (n < 0 || (size_t)n >= tmpsz) return -1;
+    fd = mkstemp(tmp);
+    return fd;
+}
+
+static int copy_bytes(int in, int out, CopyProgress *cp)
+{
     char buf[65536];
-    if (lstat(src, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
-    in = open(src, O_RDONLY | O_NOFOLLOW);
-    if (in < 0) return -1;
-    out = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-               st.st_mode & 0777);
-    if (out < 0) { close(in); return -1; }
     for (;;) {
         ssize_t n = read(in, buf, sizeof buf);
         ssize_t written = 0;
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0) { rc = -1; break; }
-        if (n == 0) break;
+        if (n < 0) return -1;
+        if (n == 0) return 0;
         while (written < n) {
             ssize_t w = write(out, buf + written, (size_t)(n - written));
             if (w < 0 && errno == EINTR) continue;
-            if (w <= 0) { rc = -1; break; }
+            if (w <= 0) return -1;
             written += w;
         }
-        if (rc < 0) break;
         note_progress(cp, n, cp ? cp->disp : NULL);
     }
-    if (rc == 0) {
-        struct timespec ts[2];
-        fchmod(out, st.st_mode & 0777);
-        ts[0] = st.st_atim;
-        ts[1] = st.st_mtim;
-        futimens(out, ts);
+}
+
+static int finish_copy_fd(int fd, const struct stat *st)
+{
+    struct timespec ts[2];
+    if (fchmod(fd, st->st_mode & 0777) != 0) return -1;
+    ts[0] = st->st_atim;
+    ts[1] = st->st_mtim;
+    futimens(fd, ts);
+    if (fsync(fd) != 0 && errno != EINVAL && errno != EROFS
+        && errno != ENOTSUP) return -1;
+    return 0;
+}
+
+static void fsync_dir(const char *path)
+{
+    int fd, saved = errno;
+    if (!path || !path[0]) return;
+    fd = open(path, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) { errno = saved; return; }
+    if (fsync(fd) != 0 && errno != EINVAL && errno != EROFS
+        && errno != ENOTSUP) {
+        close(fd);
+        return;
     }
+    close(fd);
+    errno = saved;
+}
+
+static int commit_temp(const char *tmp, const char *dst, int overwrite)
+{
+    char dir[PATH_MAX];
+    int rc;
+    /* RENAME_NOREPLACE закрывает TOCTOU: не затирать цель, появившуюся после проверки. */
+    if (!overwrite) {
+        rc = renameat2(AT_FDCWD, tmp, AT_FDCWD, dst, RENAME_NOREPLACE);
+        if (rc != 0 && (errno == EEXIST || errno == ENOTEMPTY)) return -1;
+        if (rc != 0 && errno != EINVAL && errno != ENOTSUP) return -1;
+        if (rc != 0 && dest_exists(dst)) {
+            errno = EEXIST;
+            return -1;
+        }
+        if (rc != 0) rc = rename(tmp, dst);
+    } else {
+        rc = rename(tmp, dst);
+    }
+    if (rc != 0) return -1;
+    if (path_parent(dir, sizeof dir, dst) == 0)
+        fsync_dir(dir);
+    return 0;
+}
+
+static int do_copy_file(const char *src, const char *dst, CopyProgress *cp, int overwrite)
+{
+    struct stat st;
+    char tmp[PATH_MAX];
+    int in, out, rc;
+    tmp[0] = '\0';
+    if (lstat(src, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    if (!overwrite && dest_exists(dst)) {
+        errno = EEXIST;
+        return -1;
+    }
+    in = open(src, O_RDONLY | O_NOFOLLOW);
+    if (in < 0) return -1;
+    out = open_sibling_temp(tmp, sizeof tmp, dst);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    rc = copy_bytes(in, out, cp);
+    if (rc == 0) rc = finish_copy_fd(out, &st);
     close(in);
     close(out);
-    if (rc < 0) unlink(dst);
+    if (rc == 0) rc = commit_temp(tmp, dst, overwrite);
+    if (rc != 0 && tmp[0]) unlink(tmp);
     return rc;
 }
 
@@ -280,10 +362,10 @@ static int do_copy_symlink(const char *src, const char *dst)
 }
 
 static int do_copy_depth(const char *src, const char *dst, CopyProgress *cp,
-                         dev_t root_dev, int depth);
+                         dev_t root_dev, int depth, int overwrite);
 
 static int do_copy_dir(const char *src, const char *dst, CopyProgress *cp,
-                       dev_t root_dev, int depth)
+                       dev_t root_dev, int depth, int overwrite)
 {
     DIR *d;
     struct dirent *de;
@@ -296,7 +378,8 @@ static int do_copy_dir(const char *src, const char *dst, CopyProgress *cp,
     mode = st.st_mode & 0777;
     if (mode == 0) mode = 0755;
     if (mkdir(dst, mode) == 0) created = 1;
-    else if (errno != EEXIST) return -1;
+    else if (errno != EEXIST || !overwrite) return -1;
+
     d = opendir(src);
     if (!d) {
         if (created) rmdir(dst);
@@ -315,7 +398,8 @@ static int do_copy_dir(const char *src, const char *dst, CopyProgress *cp,
         }
         if (lstat(s_child, &cst) == 0 && cst.st_dev != root_dev)
             continue;
-        if (do_copy_depth(s_child, d_child, cp, root_dev, depth + 1) != 0)
+        if (do_copy_depth(s_child, d_child, cp, root_dev, depth + 1,
+                          created ? 0 : overwrite) != 0)
             rc = -1;
     }
     if (rc == 0 && errno != 0) rc = -1;
@@ -326,7 +410,7 @@ static int do_copy_dir(const char *src, const char *dst, CopyProgress *cp,
 }
 
 static int do_copy_depth(const char *src, const char *dst, CopyProgress *cp,
-                         dev_t root_dev, int depth)
+                         dev_t root_dev, int depth, int overwrite)
 {
     struct stat st;
     if (!src || !dst || depth > CALC_SIZE_MAX_DEPTH) return -1;
@@ -334,16 +418,16 @@ static int do_copy_depth(const char *src, const char *dst, CopyProgress *cp,
     if (lstat(src, &st) != 0) return -1;
     if (depth > 0 && st.st_dev != root_dev) return 0;
     if (S_ISLNK(st.st_mode))  return do_copy_symlink(src, dst);
-    if (S_ISDIR(st.st_mode))  return do_copy_dir(src, dst, cp, root_dev, depth);
-    if (S_ISREG(st.st_mode))  return do_copy_file(src, dst, cp);
+    if (S_ISDIR(st.st_mode))  return do_copy_dir(src, dst, cp, root_dev, depth, overwrite);
+    if (S_ISREG(st.st_mode))  return do_copy_file(src, dst, cp, overwrite);
     return -1;
 }
 
-int do_copy_recursive(const char *src, const char *dst, CopyProgress *cp)
+int do_copy_recursive(const char *src, const char *dst, CopyProgress *cp, int overwrite)
 {
     struct stat st;
     if (!src || !dst || lstat(src, &st) != 0) return -1;
-    return do_copy_depth(src, dst, cp, st.st_dev, 0);
+    return do_copy_depth(src, dst, cp, st.st_dev, 0, overwrite);
 }
 
 int get_selected_or_current(FilePane *p, char paths[][PATH_MAX],
@@ -418,5 +502,8 @@ int fs_delete(const char *target)
         errno = EXDEV;
         return -1;
     }
-    return fs_delete_rec(target, st.st_dev, 0);
+    if (fs_delete_rec(target, st.st_dev, 0) != 0) return -1;
+    if (path_parent(parent, sizeof parent, target) == 0)
+        fsync_dir(parent);
+    return 0;
 }

@@ -51,45 +51,55 @@ static int is_plain_name(const char *name)
     return strchr(base, '.') == NULL;
 }
 
+static int launch_one_assoc(const char *name, char *fullbuf, const char *cmd)
+{
+    char *argv[MAX_ARGS];
+    int n = tokenize_cmd(cmd, argv, MAX_ARGS);
+    if (n <= 0 || n >= MAX_ARGS - 1) {
+        free_argv(argv, n);
+        return 0;
+    }
+    argv[n] = fullbuf;
+    argv[n + 1] = NULL;
+    spawn_detached_argv(argv);
+    free_argv(argv, n);
+    snprintf(g_app.last_action, sizeof g_app.last_action,
+             "Открыто: %s (%s)", name, cmd);
+    return 1;
+}
+
+static int launch_by_assoc(const char *name, char *fullbuf)
+{
+    const char *dot = strrchr(name, '.');
+    int i;
+    if (!dot || dot == name || !dot[1]) return 0;
+    for (i = 0; i < g_app.assoc_count; i++) {
+        if (strcasecmp(g_app.associations[i].ext, dot + 1) != 0) continue;
+        if (launch_one_assoc(name, fullbuf, g_app.associations[i].cmd))
+            return 1;
+    }
+    return 0;
+}
+
+static void launch_xdg(const char *name, char *fullbuf)
+{
+    char *argv[] = { "xdg-open", fullbuf, NULL };
+    spawn_detached_argv(argv);
+    snprintf(g_app.last_action, sizeof g_app.last_action, "Открыто: %s", name);
+}
+
 void launch_path(const char *name, const char *full)
 {
     char fullbuf[PATH_MAX];
-    const char *dot;
-    int i;
     if (!name || !full) return;
     copy_str(fullbuf, sizeof fullbuf, full);
-    dot = strrchr(name, '.');
-    if (dot && dot != name && dot[1]) {
-        const char *ext = dot + 1;
-        for (i = 0; i < g_app.assoc_count; i++) {
-            if (strcasecmp(g_app.associations[i].ext, ext) == 0) {
-                char *argv[MAX_ARGS];
-                int n = tokenize_cmd(g_app.associations[i].cmd, argv, MAX_ARGS);
-                if (n > 0 && n < MAX_ARGS - 1) {
-                    argv[n] = fullbuf;
-                    argv[n + 1] = NULL;
-                    spawn_detached_argv(argv);
-                    free_argv(argv, n);
-                    snprintf(g_app.last_action, sizeof g_app.last_action,
-                             "Открыто: %s (%s)", name,
-                             g_app.associations[i].cmd);
-                    return;
-                }
-                free_argv(argv, n);
-            }
-        }
-    }
+    if (launch_by_assoc(name, fullbuf)) return;
     if ((is_text_file(name) || is_plain_name(name))
         && !is_binary_content(fullbuf)) {
         view_file(fullbuf);
         return;
     }
-    {
-        char *xdg_argv[] = { "xdg-open", fullbuf, NULL };
-        spawn_detached_argv(xdg_argv);
-    }
-    snprintf(g_app.last_action, sizeof g_app.last_action,
-             "Открыто: %s", name);
+    launch_xdg(name, fullbuf);
 }
 
 void action_parent(FilePane *p)
@@ -164,7 +174,6 @@ void action_view(FilePane *p)
         message_box("Ошибка", "Путь слишком длинный");
         return;
     }
-    /* view_file сам отсеивает бинарники, спецфайлы и слишком большие файлы */
     view_file(full);
     snprintf(g_app.last_action, sizeof g_app.last_action,
              "Просмотр: %s", e->name);
@@ -172,7 +181,7 @@ void action_view(FilePane *p)
 
 void action_open_as(FilePane *p)
 {
-    char cmd_buf[256] = "xdg-open";
+    char cmd_buf[256] = "vim";
     Entry *e;
     char target[PATH_MAX];
     char *argv[MAX_ARGS];
@@ -183,42 +192,77 @@ void action_open_as(FilePane *p)
                       cmd_buf, sizeof cmd_buf)) return;
     if (!cmd_buf[0]) return;
     if (make_path(target, sizeof target, p->cwd, e->name) != 0) return;
+
     n = tokenize_cmd(cmd_buf, argv, MAX_ARGS);
     if (n > 0 && n < MAX_ARGS - 1) {
         argv[n] = target;
         argv[n + 1] = NULL;
-        spawn_detached_argv(argv);
+
+        spawn_sync(argv[0], argv, 1, p->cwd);
+
+        /* Очищаем буфер ввода от случайных нажатий после выхода из редактора */
+        flushinp();
+
+        snprintf(g_app.last_action, sizeof g_app.last_action,
+                 "Открыто: %s (%s)", e->name, cmd_buf);
     } else if (n > 0) {
         message_box("Ошибка", "Некорректная команда");
     }
     free_argv(argv, n);
 }
 
+static int editor_usable(const char *dir, const char *name)
+{
+    char full[PATH_MAX];
+    struct stat st;
+    int n;
+    if (!dir || !dir[0] || !name) return 0;
+    n = snprintf(full, sizeof full, "%s/%s", dir, name);
+    if (n < 0 || (size_t)n >= sizeof full) return 0;
+    /* 0, не AT_SYMLINK_NOFOLLOW: /usr/bin/vim часто симлинк alternatives. */
+    if (fstatat(AT_FDCWD, full, &st, 0) != 0) return 0;
+    return S_ISREG(st.st_mode) && (st.st_mode & S_IXUSR);
+}
+
+static int editor_in_path(const char *path, const char *name)
+{
+    char *copy, *save = NULL, *dir;
+    int ok = 0;
+    copy = strdup(path);
+    if (!copy) return 0;
+    dir = strtok_r(copy, ":", &save);
+    while (dir && !ok) {
+        ok = editor_usable(dir, name);
+        dir = strtok_r(NULL, ":", &save);
+    }
+    free(copy);
+    return ok;
+}
+
 static const char *find_editor(void)
 {
-    const char *env_ed = getenv("EDITOR");
     static const char *editors[] = { "nvim", "vim", "vi", "nano" };
-    const char *path;
-    char *path_copy, *save, *dir;
-    const char *ed = NULL;
+    const char *env_ed = getenv("EDITOR");
+    const char *path = getenv("PATH");
     int i;
     if (env_ed && *env_ed) return env_ed;
-    path = getenv("PATH");
     if (!path) return NULL;
-    for (i = 0; i < 4 && !ed; i++) {
-        path_copy = strdup(path);
-        if (!path_copy) break;
-        save = NULL;
-        dir = strtok_r(path_copy, ":", &save);
-        while (dir) {
-            char full[PATH_MAX];
-            snprintf(full, sizeof full, "%s/%s", dir, editors[i]);
-            if (access(full, X_OK) == 0) { ed = editors[i]; break; }
-            dir = strtok_r(NULL, ":", &save);
-        }
-        free(path_copy);
-    }
-    return ed;
+    for (i = 0; i < 4; i++)
+        if (editor_in_path(path, editors[i])) return editors[i];
+    return NULL;
+}
+
+static void note_spawn_fail(const char *what, int rc)
+{
+    if (rc > 0)
+        snprintf(g_app.last_action, sizeof g_app.last_action,
+                 "Ошибка %s (код %d)", what, rc);
+    else if (rc == -2)
+        snprintf(g_app.last_action, sizeof g_app.last_action,
+                 "Ошибка %s (сигнал)", what);
+    else
+        snprintf(g_app.last_action, sizeof g_app.last_action,
+                 "Ошибка %s", what);
 }
 
 void action_edit(FilePane *p)
@@ -228,7 +272,7 @@ void action_edit(FilePane *p)
     char full[PATH_MAX], keep[MAX_NAME];
     char *argv[MAX_ARGS];
     struct stat st;
-    int n;
+    int n, rc;
     e = selected_entry(p);
     if (!e || e->is_dir || e->is_parent) return;
     if (make_path(full, sizeof full, p->cwd, e->name) != 0) return;
@@ -247,8 +291,10 @@ void action_edit(FilePane *p)
     argv[n] = full;
     argv[n + 1] = NULL;
     copy_str(keep, sizeof keep, e->name);
-    run_foreground(argv, NULL);
+    rc = spawn_sync(ed, argv, 1, NULL);
     free_argv(argv, n);
+    if (rc != 0 && rc != -2)
+        note_spawn_fail("редактора", rc);
     remember(p, keep);
     reload_cwd(p->cwd);
 }
@@ -375,38 +421,58 @@ void action_template(FilePane *p)
     reload_cwd(p->cwd);
 }
 
+static int append_ext(char *name, size_t nsz, const char *ext)
+{
+    size_t used = strlen(name);
+    int n;
+    if (!ext || used >= nsz) return -1;
+    n = snprintf(name + used, nsz - used, "%s", ext);
+    return (n < 0 || (size_t)n >= nsz - used) ? -1 : 0;
+}
+
+static int archive_dest_ok(const char *path)
+{
+    struct stat st;
+    if (fstatat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT;
+    if (S_ISLNK(st.st_mode)) {
+        message_box("Архивация", "Не записываю архив поверх ссылки");
+        return 0;
+    }
+    return dialog_confirm("Архивация", "Файл уже существует. Заменить?");
+}
+
 void action_archive(FilePane *p)
 {
-    char paths[MAX_CLIP][PATH_MAX];
+    char (*paths)[PATH_MAX];
     int count;
     const char *formats[] = { ".zip", ".tar.gz", ".tar.xz" };
     int fmt;
     char archname[MAX_NAME] = "archive";
     char full_arch[PATH_MAX];
     char *argv[MAX_CLIP + 8];
-    int ai = 0, i, limit;
+    int ai = 0, i, limit, rc;
     if (!p) return;
+    paths = alloc_paths(MAX_CLIP);
+    if (!paths) return;
     count = get_selected_or_current(p, paths, MAX_CLIP);
-    if (count == 0) return;
+    if (count == 0) goto cleanup;
     fmt = run_submenu("Формат", formats, 3);
-    if (fmt < 0) return;
+    if (fmt < 0) goto cleanup;
     if (count == 1) {
         const char *base = strrchr(paths[0], '/');
         copy_str(archname, sizeof archname, base ? base + 1 : paths[0]);
     }
-    if (strlen(archname) + strlen(formats[fmt]) >= sizeof archname) {
+    if (append_ext(archname, sizeof archname, formats[fmt]) != 0) {
         bad_name();
-        return;
+        goto cleanup;
     }
-    strcat(archname, formats[fmt]);
     if (!dialog_input("Архивация", "Имя архива:",
-                      archname, sizeof archname)) return;
-    if (!name_ok(archname)) { bad_name(); return; }
+                      archname, sizeof archname)) goto cleanup;
+    if (!name_ok(archname)) { bad_name(); goto cleanup; }
     if (make_path(full_arch, sizeof full_arch, p->cwd, archname) != 0)
-        return;
-    if (access(full_arch, F_OK) == 0 &&
-        !dialog_confirm("Архивация", "Файл уже существует. Заменить?"))
-        return;
+        goto cleanup;
+    if (!archive_dest_ok(full_arch)) goto cleanup;
     if (fmt == 0) {
         argv[ai++] = "zip"; argv[ai++] = "-r";
         argv[ai++] = full_arch; argv[ai++] = "--";
@@ -420,22 +486,24 @@ void action_archive(FilePane *p)
     limit = (int)(sizeof argv / sizeof argv[0]) - 1;
     if (ai + count > limit) {
         message_box("Ошибка", "Слишком много файлов для одной команды");
-        return;
+        goto cleanup;
     }
     for (i = 0; i < count; i++) {
         char *base = strrchr(paths[i], '/');
         argv[ai++] = base ? base + 1 : paths[i];
     }
     argv[ai] = NULL;
-    if (run_foreground(argv, p->cwd) == 0) {
+    rc = spawn_sync(argv[0], argv, 1, p->cwd);
+    if (rc == 0) {
         snprintf(g_app.last_action, sizeof g_app.last_action,
                  "Создан архив: %s", archname);
         remember(p, archname);
         reload_cwd(p->cwd);
     } else {
-        snprintf(g_app.last_action, sizeof g_app.last_action,
-                 "Ошибка архивации");
+        note_spawn_fail("архивации", rc);
     }
+cleanup:
+    free_paths(paths);
 }
 
 void action_unarchive(FilePane *p)
@@ -472,22 +540,21 @@ void action_unarchive(FilePane *p)
     }
     argv[ai] = NULL;
     copy_str(keep, sizeof keep, e->name);
-    rc = run_foreground(argv, p->cwd);
+    rc = spawn_sync(argv[0], argv, 1, p->cwd);
     remember(p, keep);
     reload_cwd(p->cwd);
     if (rc == 0)
         snprintf(g_app.last_action, sizeof g_app.last_action,
                  "Разархивировано: %s", keep);
     else
-        snprintf(g_app.last_action, sizeof g_app.last_action,
-                 "Ошибка разархивации");
+        note_spawn_fail("разархивации", rc);
 }
 
 void action_copy(FilePane *p)
 {
     g_app.clip_count = get_selected_or_current(p, g_app.clip_paths, MAX_CLIP);
+    g_app.clip_is_cut = 0;
     if (g_app.clip_count > 0) {
-        g_app.clip_is_cut = 0;
         snprintf(g_app.last_action, sizeof g_app.last_action,
                  "Скопировано файлов: %d", g_app.clip_count);
     } else {
@@ -554,12 +621,19 @@ static int paste_one(FilePane *p, int i)
     if (g_app.clip_is_cut && rename(src, dst) == 0)
         return 0;
     memset(&cp, 0, sizeof cp);
-    cp.total = calc_size(src, 0);
+
+    if (S_ISDIR(st.st_mode)) {
+        cp.total = -1;
+    } else {
+        cp.total = calc_size(src, 0);
+    }
     cp.last_pct = -1;
     cp.disp = base;
     cp.win = progress_init();
-    if (cp.win) show_progress(0, cp.disp, cp.win);
-    rc = do_copy_recursive(src, dst, &cp);
+    if (cp.win) show_progress(cp.total == -1 ? -1 : 0, cp.disp, cp.win);
+
+    rc = do_copy_recursive(src, dst, &cp, 0);
+
     if (cp.win) {
         delwin(cp.win);
         touchwin(stdscr);
@@ -605,12 +679,14 @@ void action_paste(FilePane *p)
 
 void action_delete(FilePane *p)
 {
-    char paths[MAX_CLIP][PATH_MAX];
+    char (*paths)[PATH_MAX];
     int count, i, failed = 0, ok = 0;
     char msg[512];
     if (!p) return;
+    paths = alloc_paths(MAX_CLIP);
+    if (!paths) return;
     count = get_selected_or_current(p, paths, MAX_CLIP);
-    if (count == 0) return;
+    if (count == 0) goto cleanup;
     if (count == 1) {
         const char *base = strrchr(paths[0], '/');
         snprintf(msg, sizeof msg, "Удалить %.200s?",
@@ -618,7 +694,7 @@ void action_delete(FilePane *p)
     } else {
         snprintf(msg, sizeof msg, "Удалить %d объектов?", count);
     }
-    if (!dialog_confirm("Удаление", msg)) return;
+    if (!dialog_confirm("Удаление", msg)) goto cleanup;
     for (i = 0; i < count; i++) {
         if (fs_delete(paths[i]) == 0) ok++;
         else failed++;
@@ -630,6 +706,8 @@ void action_delete(FilePane *p)
         snprintf(g_app.last_action, sizeof g_app.last_action,
                  "Удалено %d, ошибок %d", ok, failed);
     reload_cwd(p->cwd);
+cleanup:
+    free_paths(paths);
 }
 
 void action_rename(FilePane *p)
@@ -663,12 +741,15 @@ void action_rename(FilePane *p)
 
 void action_pin(FilePane *p)
 {
-    char paths[MAX_CLIP][PATH_MAX];
+    char (*paths)[PATH_MAX];
     int count, i;
     if (!p) return;
+    paths = alloc_paths(MAX_CLIP);
+    if (!paths) return;
     count = get_selected_or_current(p, paths, MAX_CLIP);
     if (count == 0) add_bookmark(p->cwd);
     else for (i = 0; i < count; i++) add_bookmark(paths[i]);
+    free_paths(paths);
     save_config();
     snprintf(g_app.last_action, sizeof g_app.last_action,
              "Добавлено в избранное");
@@ -755,8 +836,11 @@ void action_info(FilePane *p)
         if (ln < 0) ln = 0;
         link_target[ln] = '\0';
     }
-    if (stat(full, &tgt_st) == 0 && S_ISREG(tgt_st.st_mode))
-        get_mime_type(full, mime_buf, sizeof mime_buf);
+    if (stat(full, &tgt_st) == 0 && S_ISREG(tgt_st.st_mode)) {
+        if (strncmp(full, "/proc/", 6) != 0 && strncmp(full, "/sys/", 5) != 0) {
+            get_mime_type(full, mime_buf, sizeof mime_buf);
+        }
+    }
     pos = appendf(info, sizeof info, pos,
                   "Имя:            %s\nПолный путь:    %s\nТип:            %s\n",
                   e->name, full, type_buf);

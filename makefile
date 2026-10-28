@@ -20,10 +20,19 @@ BIN_DIR   := build/bin
 TEST_DIR  := tests
 
 HDR       := $(SRC_DIR)/fm.h
-SRC       := $(wildcard $(SRC_DIR)/*.c)
-OBJ       := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRC))
+# Тесты (test_*.c / *_test.c) не входят в VibeyFile, даже если лежат в src/.
+# Иначе второй main из test_core.c ломает линковку.
+APP_SRC   := $(filter-out $(SRC_DIR)/test_%.c $(SRC_DIR)/%_test.c,$(wildcard $(SRC_DIR)/*.c))
+SRC       := $(APP_SRC)
+OBJ       := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(APP_SRC))
 DEP       := $(OBJ:.o=.d)
 OBJ_NO_MAIN := $(filter-out $(OBJ_DIR)/main.o,$(OBJ))
+
+# Сначала tests/, иначе — test_*.c, случайно положенный в src/.
+TEST_SRC  := $(wildcard $(TEST_DIR)/*.c)
+ifeq ($(strip $(TEST_SRC)),)
+TEST_SRC  := $(filter $(SRC_DIR)/test_%.c $(SRC_DIR)/%_test.c,$(wildcard $(SRC_DIR)/*.c))
+endif
 
 BIN       := $(BIN_DIR)/VibeyFile
 BIN_DBG   := $(BIN_DIR)/VibeyFile-debug
@@ -69,21 +78,21 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(HDR) | $(OBJ_DIR)
 test: $(BIN_TEST)
 	./$(BIN_TEST)
 
-$(BIN_TEST): $(TEST_DIR)/test_core.c $(OBJ_NO_MAIN) $(HDR) | $(BIN_DIR)
+$(BIN_TEST): $(TEST_SRC) $(OBJ_NO_MAIN) $(HDR) | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ \
-		$(TEST_DIR)/test_core.c $(OBJ_NO_MAIN) $(LDFLAGS) $(LDLIBS)
+		$(TEST_SRC) $(OBJ_NO_MAIN) $(LDFLAGS) $(LDLIBS)
 
 # ── Debug ──────────────────────────────────────────────────
 debug: $(BIN_DBG)
 
-$(BIN_DBG): $(SRC) $(HDR) | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(DBG_CFLAGS) -o $@ $(SRC) $(LDLIBS)
+$(BIN_DBG): $(APP_SRC) $(HDR) | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(DBG_CFLAGS) -o $@ $(APP_SRC) $(LDLIBS)
 
 # ── Sanitizers ─────────────────────────────────────────────
 sanitize: $(BIN_SAN)
 
-$(BIN_SAN): $(SRC) $(HDR) | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(SAN_CFLAGS) $(SAN_LDFLAGS) -o $@ $(SRC) $(LDLIBS)
+$(BIN_SAN): $(APP_SRC) $(HDR) | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(SAN_CFLAGS) $(SAN_LDFLAGS) -o $@ $(APP_SRC) $(LDLIBS)
 
 # ── Valgrind ───────────────────────────────────────────────
 valgrind: $(BIN_DBG)
