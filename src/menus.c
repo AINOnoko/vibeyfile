@@ -549,7 +549,7 @@ static int capture_binding_key(int *out)
     delwin(win);
     touchwin(stdscr);
     refresh();
-    if (ch == ERR || ch == 27) return 0;
+    if (!g_app.running || ch == ERR || ch == 27) return 0;
     *out = ch;
     return 1;
 }

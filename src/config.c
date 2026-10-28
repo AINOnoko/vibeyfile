@@ -459,7 +459,8 @@ static void seed_system_dirs(const char *home)
     add_bookmark("/etc");
     add_bookmark("/usr");
     n = snprintf(cfg, sizeof cfg, "%s/.config", home);
-    if (n > 0 && (size_t)n < sizeof cfg) add_bookmark(cfg);
+    if (n > 0 && (size_t)n < sizeof cfg && path_is_dir(cfg))
+        add_bookmark(cfg);
 }
 
 static void seed_defaults(const char *home)
@@ -494,7 +495,8 @@ void load_config(void)
     }
     if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
         fclose(f);
-        add_home_places(home);
+        if (g_app.bookmark_count == 0)
+            add_home_places(home);
         return;
     }
     g_exec_trusted = st.st_uid == getuid() && (st.st_mode & 022) == 0;
@@ -547,7 +549,8 @@ void load_config(void)
         else if (in_hist)  parse_history_line(start);
     }
     fclose(f);
-    add_home_places(home);
+    if (g_app.bookmark_count == 0)
+        add_home_places(home);
 }
 
 static void save_theme_section(FILE *f)

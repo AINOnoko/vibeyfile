@@ -292,6 +292,7 @@ void action_edit(FilePane *p)
     argv[n + 1] = NULL;
     copy_str(keep, sizeof keep, e->name);
     rc = spawn_sync(ed, argv, 1, NULL);
+    flushinp();
     free_argv(argv, n);
     if (rc != 0 && rc != -2)
         note_spawn_fail("редактора", rc);
@@ -475,7 +476,7 @@ void action_archive(FilePane *p)
     if (!archive_dest_ok(full_arch)) goto cleanup;
     if (fmt == 0) {
         argv[ai++] = "zip"; argv[ai++] = "-r";
-        argv[ai++] = full_arch; argv[ai++] = "--";
+        argv[ai++] = full_arch;
     } else if (fmt == 1) {
         argv[ai++] = "tar"; argv[ai++] = "-czf";
         argv[ai++] = full_arch; argv[ai++] = "--";

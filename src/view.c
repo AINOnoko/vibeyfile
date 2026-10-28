@@ -449,7 +449,7 @@ static int help_fill_acts(char store[][HELP_LINE_MAX], const char **lines, int n
     n = help_push(store, lines, n,
                   "  Избранное: папка, если ничего не отмечено; иначе только отмеченное");
     n = help_push(store, lines, n,
-                  "  Документы, Загрузки, Видео и т.п. сами попадают в избранное");
+                  "  Документы, Загрузки, Видео и т.п. — если избранное ещё пустое");
     n = help_pushf(store, lines, n, "  %s / [O] - Настройки", k->sett, "");
     n = help_pushf(store, lines, n, "  %s - Вкл/выкл сплит", k->split, "");
     n = help_pushf(store, lines, n, "  %s - Вкл/выкл предпросмотр", k->prev, "");
