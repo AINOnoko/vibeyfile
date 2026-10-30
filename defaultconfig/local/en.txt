@@ -1,0 +1,341 @@
+# VibeyFile: en locale
+# Format: KEY=value. The key is the name from STRINGS() WITHOUT the STR_ prefix.
+# Placeholders use printf syntax (%s, %d) because values go straight into snprintf().
+# CAUTION: a lone % in a value is a format specifier. Write %% for a literal percent.
+
+APP_NAME=VibeyFile
+
+STATUS_HELP=Help: %s
+
+STATUS_SEARCH=Search: %s
+
+INFO_PARENT=<parent>
+
+INFO_DIR=<dir>
+
+PREVIEW_TITLE=Preview
+
+PREVIEW_PARENT=<parent dir>
+
+PREVIEW_BROKEN=<broken link>
+
+PREVIEW_NO_ACCESS=<no access>
+
+PREVIEW_FOLDER=<folder>
+
+PREVIEW_SPECIAL=<special file>
+
+PREVIEW_TOO_BIG=<file too big to preview>
+
+PREVIEW_BINARY=<binary file>
+
+MSG_ATTENTION=Attention
+
+MSG_ERROR=Error
+
+MSG_NOTHING_SELECTED=Nothing selected
+
+MSG_CANT_VIEW_PARENT=Cannot view parent directory
+
+MSG_PATH_TOO_LONG=Path too long
+
+MSG_OPEN_FAILED=Cannot open: %s
+
+MSG_OPENED_ASSOC=Opened with association: %s
+
+MSG_OPENED=Opened: %s
+
+MSG_VIEWED=Viewed: %s
+
+OPEN_AS_TITLE=Open as
+
+OPEN_AS_PROMPT=Command:
+
+MSG_BAD_COMMAND=Bad command
+
+MSG_NOT_REGULAR=Not a regular file
+
+MSG_NO_EDITOR=Editor is not set
+MSG_BAD_EDITOR=Bad editor command
+MSG_EDITOR_FAILED=Cannot start the editor: %s
+MSG_EDITOR_KILLED=Editor killed by a signal: %s
+MSG_SPAWN_FAILED=Cannot run "%s": %s
+MSG_DIR_CREATED=Created directory: %s
+MSG_ERROR_STR=Error: %s
+
+MKDIR_TITLE=New directory
+MKDIR_PROMPT=Directory name:
+MSG_BAD_NAME=Bad file name
+TOUCH_TITLE=New file
+TOUCH_PROMPT=File name:
+MSG_FILE_CREATED=Created: %s
+
+MSG_FILE_EXISTS=File already exists
+
+TEMPLATE_TITLE=New from template
+MSG_FROM_TEMPLATE=Created from template: %s
+TEMPLATE_EMPTY=Empty file
+TEMPLATE_PY=Python script
+TEMPLATE_C=C source
+TEMPLATE_SH=Shell script
+TEMPLATE_DEFAULT_TXT=file.txt
+
+TEMPLATE_DEFAULT_PY=file.py
+
+TEMPLATE_DEFAULT_C=file.c
+
+TEMPLATE_DEFAULT_SH=file.sh
+
+FORMAT_TITLE=Archive format
+FORMAT_ZIP=.zip
+
+FORMAT_TGZ=.tgz
+
+FORMAT_TXZ=.txz
+
+ARCHIVE_TITLE=Create archive
+
+ARCHIVE_PROMPT=Archive name:
+
+ARCHIVE_CONFIRM=Create the archive?
+ARCHIVE_CREATED=Archive created: %s
+
+ARCHIVE_ERROR=Archive failed
+
+UNARCHIVE_UNKNOWN=Unknown archive format
+
+UNARCHIVE_DONE=Unpacked: %s
+
+UNARCHIVE_ERROR=Unpack failed
+
+MSG_COPIED_FILES=Copied to clipboard: %d
+MSG_NOTHING_TO_COPY=Nothing to copy
+
+MSG_CUT_FILES=Cut to clipboard: %d
+MSG_NOTHING_TO_CUT=Nothing to cut
+
+MSG_SELF_COPY=Cannot copy a directory into itself
+
+MSG_PASTED_FILES=Pasted: %d
+
+MSG_COPY_FAILED=Copy failed
+MSG_CLIPBOARD_EMPTY=Clipboard is empty
+DELETE_CONFIRM_FILE=Delete "%s"?
+
+DELETE_CONFIRM_MANY=Delete %d items?
+
+DELETE_TITLE=Delete
+
+MSG_DELETED_OK=Deleted: %d
+
+MSG_DELETED_FAILED=Deleted: %d, failed: %d
+
+RENAME_TITLE=Rename
+RENAME_PROMPT=New name:
+RENAME_CONFIRM=Target already exists. Overwrite?
+MSG_RENAMED=Renamed: %s -> %s
+
+MSG_RENAME_FAILED=Rename failed: %s
+
+PIN_OK=Pinned
+
+INFO_TITLE=File info
+INFO_TYPE_REG=regular file
+INFO_TYPE_DIR=directory
+INFO_TYPE_LNK=symlink
+INFO_TYPE_BLK=block device
+INFO_TYPE_CHR=char device
+INFO_TYPE_FIFO=FIFO
+INFO_TYPE_SOCK=socket
+INFO_TYPE_UNKNOWN=unknown
+INFO_NAME=Name:
+INFO_PATH=Path:
+INFO_TYPE=Type:
+INFO_MIME=MIME:
+INFO_LINK=Link to:
+INFO_SIZE=Size:
+INFO_BYTES=bytes
+INFO_PERMS=Permissions:
+INFO_OWNER=Owner:
+INFO_GROUP=Group:
+INFO_LINKS=Hard links:
+INFO_INODE=Inode:
+INFO_DEV=Device:
+INFO_MTIME=Modified:
+INFO_ATIME=Accessed:
+INFO_CTIME=Changed:
+ACT_OPEN=Open
+ACT_VIEW=View
+ACT_OPEN_AS=Open as...
+ACT_EDIT=Edit
+ACT_COPY=Copy
+ACT_CUT=Cut
+ACT_PASTE=Paste
+ACT_DELETE=Delete
+ACT_MKDIR=New directory
+ACT_TOUCH=New file
+ACT_TEMPLATE=From template
+ACT_ARCHIVE=Archive
+ACT_UNARCHIVE=Unarchive
+ACT_RENAME=Rename
+ACT_INFO=Info
+ACT_PIN=Bookmark
+ACT_REFRESH=Refresh
+ACT_QUIT=Quit
+MENU_ACTIONS=Actions
+
+BOOKMARKS_TITLE=Bookmarks
+
+BOOKMARKS_EMPTY=No bookmarks
+BOOKMARKS_DELETE=Delete bookmark "%s"?
+
+BOOKMARKS_OPEN_ERR=Cannot open the bookmark
+SET_TITLE=Settings
+SET_RESETS=Reset
+SET_RESET_ALL=Reset all settings
+SET_RESET_FAV=Reset bookmarks
+SET_RESET_THEME=Reset theme
+SET_RESET_BINDS=Reset key bindings
+SET_THEME=Theme
+SET_LANG=Language
+SET_LOCALIZATION=Localization
+SET_LANG_SELECT=Choose language:
+MSG_NO_LANG=No localization files found
+SET_BINDS=Key bindings
+SET_ASSOC=Associations
+SET_ADD_ASSOC=Add association
+SET_RESET_ALL_CONF=Reset all settings to defaults?
+SET_RESET_FAV_CONF=Reset bookmarks to defaults?
+SET_RESET_THEME_CONF=Reset theme to defaults?
+SET_RESET_BINDS_CONF=Reset key bindings to defaults?
+SET_COLOR_TITLE=Theme colour
+SET_COLOR_PROMPT=Colour (name or number):
+SET_COLOR_ERR=Unknown colour
+SET_BIND_TITLE=Bind key
+SET_BIND_PROMPT=Press a key for this action
+SET_BIND_ESC=Esc: cancel
+SET_BIND_CONFLICT=Key already in use
+SET_BIND_CONFLICT_MSG=Key %s is already bound to %s
+
+SET_ASSOC_CMD_TITLE=Association command
+
+SET_ASSOC_CMD_PROMPT=Command:
+
+SET_ASSOC_ADD_TITLE=New association
+
+SET_ASSOC_EXT_PROMPT=Extension:
+
+SET_ASSOC_DEL=Delete association "%s"?
+
+SET_FOOTER=Esc: back, Enter: select
+
+VIEW_TITLE=View: %s
+
+VIEW_HINT=File: %s  line %d of %d
+
+VIEW_HINT_H=File: %s  line %d of %d  [h-scroll %d]
+
+VIEW_ERR_OPEN=Cannot open the file
+VIEW_ERR_BIG=File is too big to view
+VIEW_ERR_MEM=Not enough memory
+VIEW_ERR_EMPTY=File is empty
+VIEW_HELP_TITLE=Help
+VIEW_HELP_FOOTER=Lines %d-%d
+
+VIEW_HELP_FOOTER_SHORT=Help
+
+MSG_ANY_KEY=Press any key
+MSG_SMALL_TERM=Terminal too small: %dx%d (need %dx%d)
+
+MSG_SMALL_TERM_HINT=Resize the terminal and try again
+MSG_PROGRESS_TITLE=Progress
+
+MSG_PROGRESS_CALC=Calculating...
+
+BTN_YES=Yes
+
+BTN_NO=No
+
+PANE_NAME=Name %s
+
+PANE_TYPE=Type %s
+
+PANE_DATE=Date %s
+
+PANE_SIZE=Size %s
+
+ARROW_UP=^
+ARROW_DOWN=v
+HELP_BANNER_1=VibeyFile: two-pane file manager
+HELP_BANNER_2=C11 + ncurses, no external dependencies
+HELP_BANNER_3=Lazy stat: only visible rows are touched
+HELP_BANNER_4=Handles UTF-8 file names
+HELP_BANNER_5=Everything is configurable
+HELP_BANNER_6=Press q to close
+HELP_NAV_TITLE=Navigation
+HELP_NAV_DOWN=Move down
+HELP_NAV_PARENT=Parent directory
+HELP_NAV_OPEN=Enter directory / view file
+HELP_NAV_HOME=Home directory
+HELP_NAV_TAB=Switch tab
+HELP_NAV_SELECT=Select item
+HELP_ACT_TITLE=Actions
+HELP_ACT_MENU=Actions menu
+HELP_ACT_BOOK=Bookmarks
+HELP_ACT_BOOK_INFO=Bookmarks and info
+HELP_ACT_BOOK_INFO2=Second bookmark / info action
+HELP_ACT_SETT=Settings
+HELP_ACT_SPLIT=Switch pane
+HELP_ACT_PREV=Preview panel
+HELP_ACT_SORT=Change sort field
+HELP_ACT_SEARCH=Search
+HELP_ACT_REFRESH=Refresh
+HELP_ACT_FULL=Full screen
+HELP_ACT_TABS=Tabs
+HELP_ACT_QUIT=Quit
+HELP_ACT_HELP=This help
+HELP_KEYBIND_HINT=Key bindings can be changed in Settings
+HELP_CREDITS=Author: VibeyFile project
+HELP_LICENSE=License: MIT
+KEY_UP=Up
+KEY_DOWN=Down
+KEY_LEFT=Left
+KEY_RIGHT=Right
+KEY_HOME=Home
+KEY_END=End
+KEY_PGUP=PageUp
+KEY_PGDN=PageDown
+KEY_BS=Backspace
+KEY_DEL=Delete
+KEY_ESC=Esc
+KEY_ENTER=Enter
+KEY_TAB=Tab
+KEY_SPACE=Space
+TYPE_DIR=DIR
+
+TYPE_TEXT=TEXT
+
+TYPE_CODE=CODE
+
+TYPE_CONF=CONF
+
+TYPE_SCRIPT=SCRIPT
+
+TYPE_WEB=WEB
+
+TYPE_IMG=IMG
+
+TYPE_AUDIO=AUDIO
+
+TYPE_VIDEO=VIDEO
+
+TYPE_ARCHIVE=ARCHIVE
+
+TYPE_PDF=PDF
+
+TYPE_EXEC=EXEC
+
+TYPE_LINK=LINK
+
+TYPE_FILE=FILE
+

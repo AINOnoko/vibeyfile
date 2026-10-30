@@ -50,31 +50,40 @@ static void build_file_info(FilePane *p, char *out, size_t outsz, const struct t
     if (!p || !p->list.items || p->list.count == 0 || p->file_sel < 0
         || p->file_sel >= (int)p->list.count) return;
     e = &p->list.items[p->file_sel];
+    entry_fill_stat(p, e);        /* ЭТАП 3: ленивый stat для status line */
     if (e->is_parent) {
-        snprintf(out, outsz, " ..  (родительский каталог)");
+        snprintf(out, outsz, "%s", T(STR_INFO_PARENT));
         return;
     }
-    if (e->is_dir) snprintf(size_str, sizeof size_str, "DIR");
+    if (e->is_dir) snprintf(size_str, sizeof size_str, "%s", T(STR_INFO_DIR));
     else           format_size(size_str, sizeof size_str, e->size);
 
     copy_str(date_str, sizeof date_str, "?");
     if (localtime_r(&e->mtime, &tmv)) {
-        if (tmv.tm_year == now_tm->tm_year)
-            strftime(date_str, sizeof date_str, "%m-%d %H:%M", &tmv);
-        else
-            strftime(date_str, sizeof date_str, "%Y-%m-%d ", &tmv);
+        /* strftime() вернёт 0, если строка не поместилась. Буферы заведомо
+         * больше нужного, но проверка дешёвая, а цена пропуска — мусор
+         * в колонке даты. */
+        if (tmv.tm_year == now_tm->tm_year) {
+            if (strftime(date_str, sizeof date_str, "%m-%d %H:%M", &tmv) == 0)
+                copy_str(date_str, sizeof date_str, "?");
+        } else {
+            if (strftime(date_str, sizeof date_str, "%Y-%m-%d ", &tmv) == 0)
+                copy_str(date_str, sizeof date_str, "?");
+        }
     }
     format_mode(perm, sizeof perm, e->mode);
     snprintf(out, outsz, " %s  |  %s  |  %s  |  %s",
              e->name, size_str, date_str, perm);
 }
 
-/* Возвращает ширину кнопки в символах, не отрисовывая её */
 static int btn_width(const char *name) {
     int k = binding_key_by_name(name);
     char kbuf[16], disp[32];
     key_display_name(k, kbuf, sizeof kbuf);
-    if (kbuf[0] && kbuf[1] == '\0') kbuf[0] = toupper((unsigned char)kbuf[0]);
+    /* ФИКС (clang-tidy, bugprone-narrowing-conversions): toupper() возвращает
+ * int, а в kbuf[] кладётся char. Значение всегда помещается (это
+ * unsigned char), но приведение нужно явно. */
+    if (kbuf[0] && kbuf[1] == '\0') kbuf[0] = (char)toupper((unsigned char)kbuf[0]);
     snprintf(disp, sizeof disp, " [%s] ", kbuf);
     return utf8_strlen(disp);
 }
@@ -83,7 +92,8 @@ static void draw_btn(int y, int x, const char *name, int pair) {
     int k = binding_key_by_name(name);
     char kbuf[16], disp[32];
     key_display_name(k, kbuf, sizeof kbuf);
-    if (kbuf[0] && kbuf[1] == '\0') kbuf[0] = toupper((unsigned char)kbuf[0]);
+    /* toupper() возвращает int — приводим явно (см. build_perm_string). */
+    if (kbuf[0] && kbuf[1] == '\0') kbuf[0] = (char)toupper((unsigned char)kbuf[0]);
     snprintf(disp, sizeof disp, " [%s] ", kbuf);
 
     attron(COLOR_PAIR(pair) | A_BOLD);
@@ -93,23 +103,23 @@ static void draw_btn(int y, int x, const char *name, int pair) {
 
 static void draw_header(int cols)
 {
-    char left[PATH_MAX + 32];
+    char left[FM_PATH_MAX + 32];
     int avail, x;
     size_t bytes;
 
-    /* Фон заголовка */
+    /* сбрасываем — заполним ниже, если действительно понадобится скролл */
+    g_app.header_scrolling = 0;
+
     attron(A_TITLE);
     mvhline(0, 0, ' ', cols);
     attroff(A_TITLE);
 
-    /* Левая часть: кнопка [Q] */
     x = 1;
     draw_btn(0, x, "quit", PAIR_BTN_QUIT);
     g_app.g_btn_x_quit = x;
     g_app.g_btn_w_quit = btn_width("quit");
     x += g_app.g_btn_w_quit;
 
-    /* Правая часть: [U] [I] [O] [P] */
     int rx = cols - 1;
 
     g_app.g_btn_w_book = btn_width("bookmarks");
@@ -133,13 +143,61 @@ static void draw_header(int cols)
     draw_btn(0, g_app.g_btn_x_help, "help", PAIR_BTN_HELP);
     draw_btn(0, g_app.g_btn_x_menu, "menu", PAIR_BTN_MENU);
 
-    /* Заголовок (только путь) между кнопками */
-    avail = rx - x;
+    avail = rx - x - 2;
     if (avail > 2) {
         attron(A_TITLE);
         snprintf(left, sizeof left, "%s", ACTIVE_PANE.cwd);
-        bytes = utf8_prefix_bytes(left, avail - 2);
-        mvaddnstr(0, x + 1, left, (int)bytes);
+
+        int len = utf8_strlen(left);
+        if (len <= avail) {
+            bytes = utf8_prefix_bytes(left, avail);
+            mvaddnstr(0, x + 1, left, (int)bytes);
+        } else {
+            /* Логика бегущей строки */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long long ms = now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+            int speed = 150; /* Скорость: 150 мс на 1 символ */
+
+            int gap = 10; /* Количество пробелов после пути */
+            /* ФИКС (clang-tidy, bugprone-narrowing-conversions): ms — long
+             * long, len — int; сумма считается в long long и лишь потом
+             * сужается в int. При 32-битном time_t переполнялось молча;
+             * теперь total_len в том же типе, что и ms, а сужение — явное
+             * и после остатка (значение гарантированно < total_len). */
+            long long total_len = (long long)len + gap;
+            int offset = total_len > 0 ? (int)((ms / speed) % total_len) : 0;
+
+            /* Создаём виртуальную строку: Путь + 10 пробелов */
+            char scroll_buf[FM_PATH_MAX + 64];
+            snprintf(scroll_buf, sizeof scroll_buf, "%s          ", left);
+
+            size_t start_byte = utf8_prefix_bytes(scroll_buf, offset);
+            const char *start_ptr = scroll_buf + start_byte;
+            int chars_in_first = utf8_strlen(start_ptr);
+
+            if (chars_in_first >= avail) {
+                /* Хватает символов до конца виртуальной строки, просто обрезаем */
+                size_t draw_bytes = utf8_prefix_bytes(start_ptr, avail);
+                mvaddnstr(0, x + 1, start_ptr, (int)draw_bytes);
+            } else {
+                /* Дошли до конца, нужно начать сначала.
+                 * BUGFIX: buf переполнялся — b1 и b2 берутся из РАЗНЫХ
+                 * буферов, их сумма не ограничена sizeof buf. При длинном
+                 * пути + узком терминале это переполнение стека. */
+                char buf[FM_PATH_MAX + 160];
+                size_t b1 = strlen(start_ptr);
+                int chars_left = avail - chars_in_first;
+                size_t b2 = utf8_prefix_bytes(scroll_buf, chars_left);
+                if (b1 > sizeof buf - 1) b1 = sizeof buf - 1;
+                if (b2 > sizeof buf - 1 - b1) b2 = sizeof buf - 1 - b1;
+                memcpy(buf, start_ptr, b1);
+                memcpy(buf + b1, scroll_buf, b2);
+                buf[b1 + b2] = '\0';
+                mvaddnstr(0, x + 1, buf, (int)(b1 + b2));
+            }
+            g_app.header_scrolling = 1;
+        }
         attroff(A_TITLE);
     }
 }
@@ -175,7 +233,7 @@ static void draw_status_line(int rows, int cols, const struct tm *now_tm)
     if (g_app.search_active) {
         char line[320];
         int cx;
-        snprintf(line, sizeof line, "Поиск: %s", g_app.search_buf);
+        snprintf(line, sizeof line, T(STR_STATUS_SEARCH), g_app.search_buf);
         bytes = utf8_prefix_bytes(line, cols > 2 ? cols - 2 : 1);
         mvaddnstr(rows - 2, 1, line, (int)bytes);
         curs_set(1);
@@ -188,7 +246,7 @@ static void draw_status_line(int rows, int cols, const struct tm *now_tm)
         char hint[64];
         int hint_len, hint_x, show_hint;
         key_display_name(binding_key_by_name("help"), khelp, sizeof khelp);
-        snprintf(hint, sizeof hint, "%s: справка", khelp);
+        snprintf(hint, sizeof hint, T(STR_STATUS_HELP), khelp);
         hint_len = utf8_strlen(hint);
         hint_x = cols - hint_len - 1;
         show_hint = (hint_x >= 10);
@@ -246,7 +304,7 @@ static void draw_preview_main(int x, int w, int rows)
     FilePane *src = &CURRENT_TAB.panes[0];
     int idx, vis, y, max_lines;
     Entry *e;
-    char full[PATH_MAX];
+    char full[FM_PATH_MAX];
     struct stat st;
     FILE *f;
     char line_buf[1024];
@@ -255,7 +313,7 @@ static void draw_preview_main(int x, int w, int rows)
     if (w < 4) return;
     attron(A_HEADER_GRAY);
     mvhline(1, x, ' ', w);
-    mvaddstr(1, x + 2, "Предпросмотр");
+    mvaddstr(1, x + 2, T(STR_PREVIEW_TITLE));
     attroff(A_HEADER_GRAY);
     vis = rows - 4;
     if (vis < 1) vis = 1;
@@ -266,32 +324,36 @@ static void draw_preview_main(int x, int w, int rows)
     idx = src->file_sel;
     if (idx < 0 || idx >= (int)src->list.count) return;
     e = &src->list.items[idx];
-    if (e->is_parent) { preview_msg(x, "<--- .."); return; }
+    if (e->is_parent) { preview_msg(x, T(STR_PREVIEW_PARENT)); return; }
     if (make_path(full, sizeof full, src->cwd, e->name) != 0) return;
     if (lstat(full, &st) == 0 && S_ISLNK(st.st_mode) && stat(full, &st) != 0) {
-        preview_msg(x, "[Битая ссылка]");
+        preview_msg(x, T(STR_PREVIEW_BROKEN));
         return;
     }
-    if (stat(full, &st) != 0) { preview_msg(x, "[Нет доступа]"); return; }
-    if (S_ISDIR(st.st_mode)) { preview_msg(x, "[Папка]"); return; }
-    if (!S_ISREG(st.st_mode)) { preview_msg(x, "[Спецфайл]"); return; }
-    if (st.st_size > 1024 * 1024) {
-        preview_msg(x, "[Слишком большой для предпросмотра]");
+    if (stat(full, &st) != 0) { preview_msg(x, T(STR_PREVIEW_NO_ACCESS)); return; }
+    if (S_ISDIR(st.st_mode)) { preview_msg(x, T(STR_PREVIEW_FOLDER)); return; }
+    if (!S_ISREG(st.st_mode)) { preview_msg(x, T(STR_PREVIEW_SPECIAL)); return; }
+    /* ФИКС (clang-tidy, bugprone-implicit-widening-of-multiplication-result):
+     * 1024 * 1024 считается в int и лишь потом расширяется до off_t; для
+     * такой константы безобидно, но привычка плохая — для 4 ГиБ выражение
+     * уже переполнилось бы. Пишем константу сразу в off_t-типе. */
+    if (st.st_size > (off_t)1 * 1024 * 1024) {
+        preview_msg(x, T(STR_PREVIEW_TOO_BIG));
         return;
     }
-    f = fopen(full, "rb");
-    if (!f) { preview_msg(x, "[Нет доступа]"); return; }
+    f = fopen(full, "rbe");
+    if (!f) { preview_msg(x, T(STR_PREVIEW_NO_ACCESS)); return; }
     nread = fread(sniff, 1, sizeof sniff, f);
     for (i = 0; i < nread; i++) {
         if (sniff[i] == 0) {
-            preview_msg(x, "[Двоичный файл]");
-            fclose(f);
+            preview_msg(x, T(STR_PREVIEW_BINARY));
+            (void)fclose(f);
             return;
         }
     }
     if (fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        preview_msg(x, "[Нет доступа]");
+        (void)fclose(f);
+        preview_msg(x, T(STR_PREVIEW_NO_ACCESS));
         return;
     }
     y = 2;
@@ -300,12 +362,11 @@ static void draw_preview_main(int x, int w, int rows)
     while (y < 2 + max_lines && fgets(line_buf, sizeof line_buf, f)) {
         size_t len = strlen(line_buf);
         size_t b;
-        while (len > 0 && (line_buf[len - 1] == '\n'
-                           || line_buf[len - 1] == '\r'))
+        while (len > 0 && (line_buf[len - 1] == '\n' || line_buf[len - 1] == '\r'))
             line_buf[--len] = '\0';
         b = utf8_prefix_bytes(line_buf, w - 2);
         mvaddnstr(y, x + 2, line_buf, (int)b);
         y++;
     }
-    fclose(f);
+    (void)fclose(f);
 }

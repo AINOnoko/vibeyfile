@@ -216,27 +216,51 @@ scroll:
 static void handle_search_key(int ch)
 {
     int i;
-    if (ch == KEY_F(1)) { g_app.search_active = 0; switch_tab(0); }
-    else if (ch == KEY_F(2)) { g_app.search_active = 0; switch_tab(1); }
-    else if (ch == KEY_F(3)) { g_app.search_active = 0; switch_tab(2); }
-    else if (ch == KEY_F(4)) { g_app.search_active = 0; switch_tab(3); }
-    else if (ch == 27 || ch == CTRL('c')) g_app.search_active = 0;
-    else if (ch == '\n' || ch == KEY_ENTER) g_app.search_active = 0;
-    else if (ch == 127 || ch == KEY_BACKSPACE) {
+    /* Toggle: та же клавиша, что включает поиск, его и выключает. */
+    int search_key = binding_key_by_name("search");
+    if (search_key && ch == search_key) {
+        g_app.search_active = 0;
+        return;
+    }
+    /* ФИКС (clang-tidy, bugprone-branch-clone): пять веток с одинаковым
+     * телом `g_app.search_active = 0` и разным лишь побочным действием.
+     * Сведено к «вычислить действие, затем применить один раз»: так видно,
+     * что гашение поиска здесь общее, а не скопировано. */
+    {
+        int tab = -1;
+        if (ch >= KEY_F(1) && ch <= KEY_F(4)) {
+            tab = ch - KEY_F(1);
+        } else if (ch == 27 || ch == CTRL('c')
+                   || ch == '\n' || ch == KEY_ENTER) {
+            tab = -2;                    /* только погасить поиск */
+        }
+        if (tab != -1) {
+            g_app.search_active = 0;
+            if (tab >= 0) switch_tab(tab);
+            return;
+        }
+    }
+    if (ch == 127 || ch == KEY_BACKSPACE) {
         if (g_app.search_len > 0) {
-            while (g_app.search_len > 0
-                   && ((unsigned char)g_app.search_buf[--g_app.search_len]
-                       & 0xC0) == 0x80)
-                {}
+            /* ФИКС (clang-tidy, bugprone-inc-dec-in-conditions): декремент
+             * спрятан в подвыражении индекса — читателю не видно, меняется
+             * ли search_len вообще, а порядок вычисления тут критичен
+             * (сначала декремент, потом чтение). Разнесено на два шага. */
+            while (g_app.search_len > 0) {
+                g_app.search_len--;
+                if (((unsigned char)g_app.search_buf[g_app.search_len]
+                     & 0xC0) != 0x80)
+                    break;
+            }
             g_app.search_buf[g_app.search_len] = '\0';
         }
     } else if (ch >= 32 && ch <= 255) {
-        if (g_app.search_len < (int)sizeof(g_app.search_buf) - 1) {
+        if (g_app.search_len < (int)sizeof g_app.search_buf - 1) {
             g_app.search_buf[g_app.search_len++] = (char)ch;
             g_app.search_buf[g_app.search_len] = '\0';
         }
     } else if ((ch >> 8) == 0xD0 || (ch >> 8) == 0xD1) {
-        if (g_app.search_len < (int)sizeof(g_app.search_buf) - 2) {
+        if (g_app.search_len < (int)sizeof g_app.search_buf - 2) {
             g_app.search_buf[g_app.search_len++] = (char)(ch >> 8);
             g_app.search_buf[g_app.search_len++] = (char)(ch & 0xFF);
             g_app.search_buf[g_app.search_len] = '\0';
@@ -294,7 +318,10 @@ static void handle_layout_bound(const char *bound)
         load_dir(&CURRENT_TAB.panes[1]);
         return;
     }
-    if (strcmp(bound, "preview")) return;
+    /* ФИКС (clang-tidy, bugprone-suspicious-string-compare): `if (strcmp(a,b))`
+     * читается как «если строки равны», хотя в C истина — это «НЕ равны».
+     * Смысл здесь верный, но запись неоднозначная; == 0 убирает вопрос. */
+    if (strcmp(bound, "preview") != 0) return;
     CURRENT_TAB.preview_mode = !CURRENT_TAB.preview_mode;
     if (!CURRENT_TAB.preview_mode) return;
     CURRENT_TAB.split_mode = 1;
@@ -392,6 +419,13 @@ static void handle_fallback_key(int ch, int vis)
         ACTIVE_PANE.file_sel -= vis / 2;
         if (ACTIVE_PANE.file_sel < 0) ACTIVE_PANE.file_sel = 0;
         break;
+    /* ФИКС (clang-tidy, bugprone-switch-missing-default-case): switch по
+     * значению keypad, а не по enum — любая необработанная клавиша
+     * молча падает в «нет ветки». Это правильно, но должно быть
+     * записано явно: иначе невозможно отличить «забыли клавишу» от
+     * «намеренно игнорируем». */
+    default:
+        return;
     }
 }
 

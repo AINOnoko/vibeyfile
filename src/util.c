@@ -1,5 +1,41 @@
 #include "fm.h"
 
+const char *string_keys[STR_COUNT] = {
+#define X(id) #id,
+    STRINGS(X)
+#undef X
+};
+
+/* Возвращает локализованную строку. Если локализация недоступна,
+ * возвращает:
+ *   - для функциональных строк (имена файлов, расширения, кнопки) —
+ *     разумный встроенный дефолт;
+ *   - для остальных — внутреннее имя ключа без префикса STR_
+ *     (читаемое «системное имя»). */
+const char *T(StrId id) {
+    if (id < 0 || id >= STR_COUNT) return "";
+    if (g_app.strings[id][0]) return g_app.strings[id];
+    switch (id) {
+    case STR_TEMPLATE_DEFAULT_TXT: return "file.txt";
+    case STR_TEMPLATE_DEFAULT_PY:  return "file.py";
+    case STR_TEMPLATE_DEFAULT_C:   return "file.c";
+    case STR_TEMPLATE_DEFAULT_SH:  return "file.sh";
+    case STR_FORMAT_ZIP:           return ".zip";
+    case STR_FORMAT_TGZ:           return ".tgz";
+    case STR_FORMAT_TXZ:           return ".txz";
+    case STR_BTN_YES:              return "Yes";
+    case STR_BTN_NO:               return "No";
+    default:
+        /* ФИКС: было string_keys[id] + 4 — «срезать STR_». Срез верен только
+         * для имён, где первые 4 символа буквально «STR_», но ключи в
+         * STRINGS(X) записаны БЕЗ него (X(STATUS_HELP) → "STATUS_HELP").
+         * Поэтому на экран попадало «US_HELP», «R_TITLE», «_DIR» —
+         * я сам это и занёс, а увидел только когда проверил запуск БЕЗ
+         * файла локализации. Теперь возвращается ключ целиком. */
+        return string_keys[id];
+    }
+}
+
 void copy_str(char *dst, size_t dstsz, const char *src)
 {
     size_t len;
@@ -9,6 +45,131 @@ void copy_str(char *dst, size_t dstsz, const char *src)
     if (len >= dstsz) len = dstsz - 1;
     memmove(dst, src, len);
     dst[len] = '\0';
+}
+
+/* Усечение строки по ГРАНИЦЕ СИМВОЛА. snprintf("%s") обрезает по байтам
+ * и может разрубить многобайтовую последовательность → на терминале
+ * появляются мусорные байты (а в strcmp — «разные» строки, которые
+ * выглядят одинаково). */
+size_t utf8_truncate(char *dst, size_t dstsz, const char *src)
+{
+    size_t b;
+    if (!dst || dstsz == 0) return 0;
+    dst[0] = '\0';
+    if (!src) return 0;
+    b = utf8_prefix_bytes(src, 1 << 24);   /* все полные символы */
+    if (b >= dstsz) {
+        b = dstsz - 1;
+        /* откатиться до начала последнего символа */
+        while (b > 0 && ((unsigned char)src[b] & 0xC0) == 0x80) b--;
+    }
+    memcpy(dst, src, b);
+    dst[b] = '\0';
+    return b;
+}
+
+/* === БЕЗОПАСНОСТЬ ФОРМАТА: валидатор строк локализации ===
+ * Разбирает значение как printf-формат и считает подстановки. Отвергает:
+ *  - спецификаторы, которых мы никогда не подставляем (%n, %p, %f, %x...);
+ *  - больше FMT_ARGS_MAX подстановок (значит, в перевод вписали лишний %);
+ *  - «%» в конце строки и незакрытые/битые флаги.
+ * Флаги/ширина/точность разрешены — «%-18s» в переводах легитимен. */
+static int fmt_parse(const char *fmt, int *nconv, char *why, size_t whysz)
+{
+    const char *p;
+    if (!fmt) return -1;
+    *nconv = 0;
+    for (p = fmt; *p; p++) {
+        if (*p != '%') continue;
+        p++;
+        if (*p == '%') continue;                 /* %% — литеральный процент */
+        while (*p && strchr("-+ #0'", *p)) p++;  /* флаги */
+        while (*p >= '0' && *p <= '9') p++;      /* ширина */
+        if (*p == '.') { p++; while (*p >= '0' && *p <= '9') p++; }  /* точность */
+        if (!*p) {
+            snprintf(why, whysz, "«%%» в конце строки");
+            return -1;
+        }
+        switch (*p) {
+        case 's': case 'd': case 'i': case 'u':
+        case 'c': case 'l': {
+            /* l/ll + d/i/u — допустимая длина; отдельно не разбираем */
+            break;
+        }
+        case 'n': case 'p': case 'x': case 'X': case 'o':
+        case 'f': case 'F': case 'g': case 'G': case 'e': case 'E':
+        case 'a': case 'A': {
+            snprintf(why, whysz, "недопустимый спецификатор «%%%c»", *p);
+            return -1;
+        }
+        default:
+            snprintf(why, whysz, "неизвестный спецификатор после «%%» (байт 0x%02X)",
+                     (unsigned char)*p);
+            return -1;
+        }
+        (*nconv)++;
+        if (*nconv > FMT_ARGS_MAX) {
+            snprintf(why, whysz, "больше %d подстановок", FMT_ARGS_MAX);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int fmt_key_is_checked(StrId id)
+{
+    return fmt_key_arity(id) >= 0;
+}
+
+/* ФИКС (clang-tidy, bugprone-branch-clone): FMT_STRINGS — это список
+ * «ключ, число подстановок», и switch из него давал до 11 совпадающих тел
+ * подряд (все ключи с арностью 1). Заменено таблицей значений: она
+ * строится один раз из того же макроса, поэтому расхождение между
+ * списком ключей и арностью физически невозможно — раньше это держалось
+ * на дисциплине копирования. */
+static signed char fmt_arity_tab[STR_COUNT];
+static unsigned fmt_arity_built;
+
+static void fmt_arity_build(void)
+{
+    int i;
+    if (fmt_arity_built) return;
+    /* ВАЖНО: -1 (не формат) и 0 (формат без подстановок) — разные вещи,
+     * и в FMT_STRINGS есть ключи с арностью 0 (например, тексты
+     * ассоциаций). Поэтому сначала весь массив помечается как «не
+     * формат», и только потом FMT_STRINGS проставляет арности, включая
+     * нули. Первая версия этой правки заливала нули в -1 и тем самым
+     * ВЫКЛЮЧАЛА проверку форматов у четырёх ключей — поймано сверкой
+     * с ожидаемыми арностями в test_audit_locale_formats. */
+    for (i = 0; i < (int)(sizeof fmt_arity_tab / sizeof fmt_arity_tab[0]); i++)
+        fmt_arity_tab[i] = -1;
+#define X(k, n) fmt_arity_tab[STR_##k] = (signed char)(n);
+    FMT_STRINGS(X)
+#undef X
+    fmt_arity_built = 1;
+}
+
+int fmt_key_arity(StrId id)
+{
+    if ((int)id < 0 || (int)id >= STR_COUNT) return -1;
+    fmt_arity_build();
+    return fmt_arity_tab[id];
+}
+
+int fmt_value_rejected(StrId id, const char *val, char *why, size_t whysz)
+{
+    int n = 0, argc = fmt_key_arity(id);
+    if (argc < 0) return 0;                     /* не формат — не наше дело */
+    if (!val || !val[0]) return 0;              /* пустое = «нет перевода» */
+    if (fmt_parse(val, &n, why, whysz) != 0) return 1;
+    /* ФИКС: синтаксис верный, но число подстановок не совпадает с тем,
+     * сколько аргументов реально передаёт код. «Строка %d из %d» вместо
+     * «%s, %d из %d» — это уже чтение чужого аргумента со стека. */
+    if (n != argc) {
+        snprintf(why, whysz, "подстановок %d, а код передаёт %d", n, argc);
+        return 1;
+    }
+    return 0;
 }
 
 int utf8_strlen(const char *s)
@@ -155,7 +316,18 @@ int name_ok(const char *name)
     for (i = 0; i < n; i++) {
         unsigned char c = (unsigned char)name[i];
         if (c == '/' || c == '\\' || c < 32 || c == 127) return 0;
+        /* ФИКС: символы, которые ext4 примет, а FAT/NTFS — нет.
+         * Менеджер копирует на флешки, и создавать файл, который потом
+         * невозможно записать на носитель, — плохая услуга. Запрет
+         * действует только на СОЗДАНИЕ имени (name_ok), существующие
+         * файлы с такими именами по-прежнему видны и открываются. */
+        if (c == ':' || c == '*' || c == '?' || c == '"' ||
+            c == '<' || c == '>' || c == '|')
+            return 0;
     }
+    /* Windows не хранит точку/пробел в конце имени — такой файл
+     * «исчезнет» при копировании. */
+    if (name[n - 1] == '.' || name[n - 1] == ' ') return 0;
     return 1;
 }
 
@@ -236,36 +408,36 @@ void path_display(char *out, size_t outsz, const char *path)
 typedef struct {
     const char *ext;
     char icon;
-    const char *kind;
+    StrId kind_id;
     int text;
 } ExtInfo;
 
 static const ExtInfo k_exts[] = {
-    {"txt", 'T', "текст", 1}, {"log", 'T', "текст", 1},
-    {"md", 'M', "текст", 1}, {"rst", 0, "текст", 1},
-    {"c", 'C', "код", 1}, {"h", 'C', "код", 1},
-    {"cpp", 'C', "код", 1}, {"cc", 'C', "код", 1}, {"hpp", 'C', "код", 1},
-    {"py", 'P', "код", 1}, {"rs", 'R', "код", 1}, {"go", 'G', "код", 1},
-    {"js", 'J', "код", 1}, {"ts", 'J', "код", 1},
-    {"java", 0, "код", 1}, {"rb", 0, "код", 1},
-    {"json", '{', "конфиг", 1}, {"yaml", 'Y', "конфиг", 1},
-    {"yml", 'Y', "конфиг", 1}, {"toml", 'Y', "конфиг", 1},
-    {"ini", 0, "конфиг", 1}, {"xml", '<', "конфиг", 1},
-    {"sh", '$', "скрипт", 1}, {"bash", '$', "скрипт", 1},
-    {"zsh", '$', "скрипт", 1}, {"fish", 0, "скрипт", 1},
-    {"html", 'W', "веб", 0}, {"htm", 'W', "веб", 0},
-    {"css", 'S', "веб", 0}, {"scss", 0, "веб", 0},
-    {"png", 'I', "изобр", 0}, {"jpg", 'I', "изобр", 0},
-    {"jpeg", 'I', "изобр", 0}, {"gif", 'I', "изобр", 0},
-    {"bmp", 'I', "изобр", 0}, {"svg", 'I', "изобр", 0}, {"webp", 0, "изобр", 0},
-    {"mp3", 'A', "аудио", 0}, {"wav", 'A', "аудио", 0},
-    {"flac", 'A', "аудио", 0}, {"ogg", 'A', "аудио", 0},
-    {"mp4", 'V', "видео", 0}, {"mkv", 'V', "видео", 0},
-    {"avi", 'V', "видео", 0}, {"webm", 'V', "видео", 0},
-    {"zip", 'Z', "архив", 0}, {"tar", 'Z', "архив", 0},
-    {"gz", 'Z', "архив", 0}, {"xz", 'Z', "архив", 0},
-    {"bz2", 'Z', "архив", 0}, {"7z", 'Z', "архив", 0},
-    {"pdf", 'F', "PDF", 0},
+    {"txt", 'T', STR_TYPE_TEXT, 1}, {"log", 'T', STR_TYPE_TEXT, 1},
+    {"md", 'M', STR_TYPE_TEXT, 1}, {"rst", 0, STR_TYPE_TEXT, 1},
+    {"c", 'C', STR_TYPE_CODE, 1}, {"h", 'C', STR_TYPE_CODE, 1},
+    {"cpp", 'C', STR_TYPE_CODE, 1}, {"cc", 'C', STR_TYPE_CODE, 1}, {"hpp", 'C', STR_TYPE_CODE, 1},
+    {"py", 'P', STR_TYPE_CODE, 1}, {"rs", 'R', STR_TYPE_CODE, 1}, {"go", 'G', STR_TYPE_CODE, 1},
+    {"js", 'J', STR_TYPE_CODE, 1}, {"ts", 'J', STR_TYPE_CODE, 1},
+    {"java", 0, STR_TYPE_CODE, 1}, {"rb", 0, STR_TYPE_CODE, 1},
+    {"json", '{', STR_TYPE_CONF, 1}, {"yaml", 'Y', STR_TYPE_CONF, 1},
+    {"yml", 'Y', STR_TYPE_CONF, 1}, {"toml", 'Y', STR_TYPE_CONF, 1},
+    {"ini", 0, STR_TYPE_CONF, 1}, {"xml", '<', STR_TYPE_CONF, 1},
+    {"sh", '$', STR_TYPE_SCRIPT, 1}, {"bash", '$', STR_TYPE_SCRIPT, 1},
+    {"zsh", '$', STR_TYPE_SCRIPT, 1}, {"fish", 0, STR_TYPE_SCRIPT, 1},
+    {"html", 'W', STR_TYPE_WEB, 0}, {"htm", 'W', STR_TYPE_WEB, 0},
+    {"css", 'S', STR_TYPE_WEB, 0}, {"scss", 0, STR_TYPE_WEB, 0},
+    {"png", 'I', STR_TYPE_IMG, 0}, {"jpg", 'I', STR_TYPE_IMG, 0},
+    {"jpeg", 'I', STR_TYPE_IMG, 0}, {"gif", 'I', STR_TYPE_IMG, 0},
+    {"bmp", 'I', STR_TYPE_IMG, 0}, {"svg", 'I', STR_TYPE_IMG, 0}, {"webp", 0, STR_TYPE_IMG, 0},
+    {"mp3", 'A', STR_TYPE_AUDIO, 0}, {"wav", 'A', STR_TYPE_AUDIO, 0},
+    {"flac", 'A', STR_TYPE_AUDIO, 0}, {"ogg", 'A', STR_TYPE_AUDIO, 0},
+    {"mp4", 'V', STR_TYPE_VIDEO, 0}, {"mkv", 'V', STR_TYPE_VIDEO, 0},
+    {"avi", 'V', STR_TYPE_VIDEO, 0}, {"webm", 'V', STR_TYPE_VIDEO, 0},
+    {"zip", 'Z', STR_TYPE_ARCHIVE, 0}, {"tar", 'Z', STR_TYPE_ARCHIVE, 0},
+    {"gz", 'Z', STR_TYPE_ARCHIVE, 0}, {"xz", 'Z', STR_TYPE_ARCHIVE, 0},
+    {"bz2", 'Z', STR_TYPE_ARCHIVE, 0}, {"7z", 'Z', STR_TYPE_ARCHIVE, 0},
+    {"pdf", 'F', STR_TYPE_PDF, 0},
 };
 
 static const ExtInfo *lookup_ext(const char *name)
@@ -285,25 +457,27 @@ static int mode_exec(mode_t mode)
     return (mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
 }
 
-char file_icon(const char *name, int is_dir, mode_t mode)
+char file_icon(const char *name, int is_dir, int is_link, mode_t mode)
 {
     const ExtInfo *info;
     if (!name) return '-';
+    if (is_link) return '@';
     if (is_dir) return 'D';
     if (name[0] == '.') return '.';
     if (mode_exec(mode)) return 'X';
     info = lookup_ext(name);
-    return (info && info->icon) ? info->icon : '-';
+    return (char)((info && info->icon) ? info->icon : '-');
 }
 
-const char *type_str(const char *name, int is_dir, mode_t mode)
+const char *type_str(const char *name, int is_dir, int is_link, mode_t mode)
 {
     const ExtInfo *info;
-    if (!name) return "файл";
-    if (is_dir) return "папка";
+    if (!name) return T(STR_TYPE_FILE);
+    if (is_dir) return T(STR_TYPE_DIR);
+    if (is_link) return T(STR_TYPE_LINK);
     info = lookup_ext(name);
-    if (info && info->kind) return info->kind;
-    return mode_exec(mode) ? "исп" : "файл";
+    if (info && info->kind_id) return T(info->kind_id);
+    return mode_exec(mode) ? T(STR_TYPE_EXEC) : T(STR_TYPE_FILE);
 }
 
 int is_text_file(const char *name)
@@ -325,20 +499,20 @@ int binding_key_by_name(const char *name)
 void key_display_name(int key, char *out, size_t outsz)
 {
     if (!out || outsz == 0) return;
-    if (key == '\n')                 snprintf(out, outsz, "Enter");
-    else if (key == '\t')            snprintf(out, outsz, "Tab");
-    else if (key == ' ')             snprintf(out, outsz, "Space");
-    else if (key == 27)              snprintf(out, outsz, "Esc");
+    if (key == '\n')                 copy_str(out, outsz, T(STR_KEY_ENTER));
+    else if (key == '\t')            copy_str(out, outsz, T(STR_KEY_TAB));
+    else if (key == ' ')             copy_str(out, outsz, T(STR_KEY_SPACE));
+    else if (key == 27)              copy_str(out, outsz, T(STR_KEY_ESC));
     else if (key >= KEY_F(1) && key <= KEY_F(12))
         snprintf(out, outsz, "F%d", key - KEY_F(1) + 1);
-    else if (key == KEY_UP)          snprintf(out, outsz, "Up");
-    else if (key == KEY_DOWN)        snprintf(out, outsz, "Down");
-    else if (key == KEY_LEFT)        snprintf(out, outsz, "Left");
-    else if (key == KEY_RIGHT)       snprintf(out, outsz, "Right");
-    else if (key == KEY_HOME)        snprintf(out, outsz, "Home");
-    else if (key == KEY_END)         snprintf(out, outsz, "End");
-    else if (key == KEY_PPAGE)       snprintf(out, outsz, "PgUp");
-    else if (key == KEY_NPAGE)       snprintf(out, outsz, "PgDn");
+    else if (key == KEY_UP)          copy_str(out, outsz, T(STR_KEY_UP));
+    else if (key == KEY_DOWN)        copy_str(out, outsz, T(STR_KEY_DOWN));
+    else if (key == KEY_LEFT)        copy_str(out, outsz, T(STR_KEY_LEFT));
+    else if (key == KEY_RIGHT)       copy_str(out, outsz, T(STR_KEY_RIGHT));
+    else if (key == KEY_HOME)        copy_str(out, outsz, T(STR_KEY_HOME));
+    else if (key == KEY_END)         copy_str(out, outsz, T(STR_KEY_END));
+    else if (key == KEY_PPAGE)       copy_str(out, outsz, T(STR_KEY_PGUP));
+    else if (key == KEY_NPAGE)       copy_str(out, outsz, T(STR_KEY_PGDN));
     else if (key >= 32 && key < 127) { out[0] = (char)key; out[1] = '\0'; }
     else                             snprintf(out, outsz, "?");
 }
@@ -413,13 +587,23 @@ void binding_key_to_str(int key, char *out, size_t outsz)
     else                             snprintf(out, outsz, "?");
 }
 
-char (*alloc_paths(int n))[PATH_MAX]
+/* ЭТАП 1: вектор указателей вместо calloc(n, PATH_MAX).
+ * 256 * 4096 = 1 МиБ calloc'а на каждую операцию delete/pin/archive
+ * превращается в 256 * sizeof(char*) = 2 КиБ: сами пути выделяются
+ * по фактической длине через strdup() в get_selected_or_current().
+ */
+char **alloc_path_vec(int n)
 {
     if (n <= 0) return NULL;
-    return calloc((size_t)n, sizeof(char[PATH_MAX]));
+    /* C: calloc возвращает void*, приведение к char** неявное и корректное;
+     * в C++ так нельзя, отсюда и предупреждение clang-tidy. */
+    return calloc((size_t)n, sizeof(char *));
 }
 
-void free_paths(char (*p)[PATH_MAX])
+void free_path_vec(char **v, int n)
 {
-    free(p);
+    int i;
+    if (!v) return;
+    for (i = 0; i < n; i++) free(v[i]);
+    free(v);
 }

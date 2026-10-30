@@ -25,7 +25,7 @@ void draw_pane_header(FilePane *p, int pane_idx, int x, int w,
     PaneGeom g;
     char h_name[64], h_type[64], h_date[64], h_size[64];
     char name_padded[512], type_padded[64], date_padded[64], size_padded[64];
-    const char *arrow = p->sort_desc ? "▼" : "▲";
+    const char *arrow = p->sort_desc ? T(STR_ARROW_DOWN) : T(STR_ARROW_UP);
     compute_geometry(x, w, show_type, show_date, show_size, &g);
     if (pane_idx >= 0 && pane_idx < 2) {
         g_app.g_x_name[pane_idx] = g.x_name;
@@ -35,14 +35,16 @@ void draw_pane_header(FilePane *p, int pane_idx, int x, int w,
     }
     attron(A_HEADER_GRAY);
     mvhline(1, x, ' ', w);
-    snprintf(h_name, sizeof h_name, "Имя %s",
+
+    snprintf(h_name, sizeof h_name, T(STR_PANE_NAME),
              (p->sort_field == SORT_NAME) ? arrow : " ");
-    snprintf(h_type, sizeof h_type, "Тип %s",
+    snprintf(h_type, sizeof h_type, T(STR_PANE_TYPE),
              (p->sort_field == SORT_TYPE) ? arrow : " ");
-    snprintf(h_date, sizeof h_date, "Изменён %s",
+    snprintf(h_date, sizeof h_date, T(STR_PANE_DATE),
              (p->sort_field == SORT_DATE) ? arrow : " ");
-    snprintf(h_size, sizeof h_size, "Размер %s",
+    snprintf(h_size, sizeof h_size, T(STR_PANE_SIZE),
              (p->sort_field == SORT_SIZE) ? arrow : " ");
+
     build_padded(name_padded, sizeof name_padded, h_name, g.name_w, 0);
     build_padded(type_padded, sizeof type_padded, h_type, TYPE_W, 0);
     build_padded(date_padded, sizeof date_padded, h_date, DATE_W, 0);
@@ -68,21 +70,28 @@ static int row_attr(FilePane *p, Entry *e, int idx, int is_active)
     return A_PANEL;
 }
 
-static void entry_date_size(Entry *e, char *date_str, char *size_str,
+static void entry_date_size(FilePane *p, Entry *e, char *date_str, char *size_str,
                             size_t dsz, size_t ssz, const struct tm *now_tm)
 {
     struct tm tmv;
+    /* ЭТАП 3: размер/mtime берутся из dirent-кэша; настоящий stat()
+     * выполняется один раз и только для ВИДИМОЙ строки (stat_done). */
+    entry_fill_stat(p, e);
     if (e->is_parent) {
-        snprintf(size_str, ssz, "DIR");
+        snprintf(size_str, ssz, "%s", T(STR_INFO_DIR));
         return;
     }
     if (localtime_r(&e->mtime, &tmv)) {
-        if (tmv.tm_year == now_tm->tm_year)
-            strftime(date_str, dsz, "%m-%d %H:%M", &tmv);
-        else
-            strftime(date_str, dsz, "%Y-%m-%d ", &tmv);
+        /* strftime() вернёт 0 при нехватке места — не оставляем мусор. */
+        if (tmv.tm_year == now_tm->tm_year) {
+            if (strftime(date_str, dsz, "%m-%d %H:%M", &tmv) == 0)
+                copy_str(date_str, dsz, "?");
+        } else {
+            if (strftime(date_str, dsz, "%Y-%m-%d ", &tmv) == 0)
+                copy_str(date_str, dsz, "?");
+        }
     }
-    if (e->is_dir) snprintf(size_str, ssz, "DIR");
+    if (e->is_dir) snprintf(size_str, ssz, "%s", T(STR_INFO_DIR));
     else           format_size(size_str, ssz, e->size);
 }
 
@@ -97,7 +106,7 @@ static void build_row(char *row, size_t rowsz, FilePane *p, Entry *e,
     const char *tname;
     int pos;
 
-    entry_date_size(e, date_str, size_str, sizeof date_str,
+    entry_date_size(p, e, date_str, size_str, sizeof date_str,
                     sizeof size_str, now_tm);
 
     if (e->is_parent)
@@ -112,7 +121,8 @@ static void build_row(char *row, size_t rowsz, FilePane *p, Entry *e,
     build_padded(type_padded, sizeof type_padded, tname, TYPE_W, 0);
     build_padded(date_padded, sizeof date_padded, date_str, DATE_W, 0);
     build_padded(size_padded, sizeof size_padded, size_str, SIZE_W, 1);
-    mark_char = (idx == p->file_sel) ? '>' : (e->selected ? '*' : ' ');
+    /* символьные константы в C имеют тип int — сужение снимаем явно */
+    mark_char = (char)((idx == p->file_sel) ? '>' : (e->selected ? '*' : ' '));
     pos = snprintf(row, rowsz, "%c [%c] %s", mark_char, icon, name_padded);
     if (pos < 0 || (size_t)pos >= rowsz) return;
     if (g->show_type)
@@ -147,7 +157,13 @@ static void draw_scrollbar(FilePane *p, int x, int w, int items_y, int vis)
 {
     int bar_x = x + w - 1;
     int total = (int)p->list.count;
-    int thumb_h = (vis * vis) / total;
+    int thumb_h;
+    /* ФИКС: деление на total без проверки. Сейчас вызывается только при
+     * needs_scroll (total > vis >= 1), т.е. недостижимо, но деление на ноль —
+     * это UB, а не «просто ошибка»: оптимизатор вправе выкинуть проверку.
+     * В view.c/menus.c аналогичные функции начинаются с той же строки. */
+    if (total <= vis) return;
+    thumb_h = (vis * vis) / total;
     int max_scroll = total - vis;
     int thumb_pos, i;
     if (thumb_h < 1) thumb_h = 1;
