@@ -1,20 +1,22 @@
 #include "fm.h"
 
-static const char *ACTION_NAMES[ACT_COUNT] = {
-    "Открыть", "Посмотреть", "Открыть как", "Правка",
-    "Копировать", "Вырезать", "Вставить", "Удалить",
-    "Создать папку", "Создать файл", "Создать из шаблона",
-    "Архивировать", "Разархивировать",
-    "Переименовать", "Свойства", "В избранное", "Обновить", "Выход"
+static const StrId ACTION_IDS[ACT_COUNT] = {
+    STR_ACT_OPEN, STR_ACT_VIEW, STR_ACT_OPEN_AS, STR_ACT_EDIT,
+    STR_ACT_COPY, STR_ACT_CUT, STR_ACT_PASTE, STR_ACT_DELETE,
+    STR_ACT_MKDIR, STR_ACT_TOUCH, STR_ACT_TEMPLATE, STR_ACT_ARCHIVE,
+    STR_ACT_UNARCHIVE, STR_ACT_RENAME, STR_ACT_INFO, STR_ACT_PIN,
+    STR_ACT_REFRESH, STR_ACT_QUIT
 };
 
-int run_submenu(const char *title, const char **options, int count)
+int run_submenu(const char *title, const char **options, int count, int start_sel)
 {
     int max_len, menu_w, menu_h, rows, cols, i;
     if (!title || !options || count <= 0) return -1;
     max_len = utf8_strlen(title);
-    int start_x, start_y, sel = 0, ch, res = -1, running = 1;
+    int start_x, start_y, sel = start_sel, ch, res = -1, running = 1;
     WINDOW *win = NULL;
+
+    if (sel < 0 || sel >= count) sel = 0;
 
     for (i = 0; i < count; i++) {
         int len = utf8_strlen(options[i]);
@@ -86,7 +88,7 @@ static void draw_menu_strip(WINDOW *win, int menu_w, int scroll, int sel,
     int i;
     wattron(win, A_HEADER_GRAY);
     mvwhline(win, 0, 1, ' ', menu_w - 2);
-    mvwprintw(win, 0, (menu_w - utf8_strlen("Действия")) / 2, "Действия");
+    mvwprintw(win, 0, (menu_w - utf8_strlen(T(STR_MENU_ACTIONS))) / 2, "%s", T(STR_MENU_ACTIONS));
     wattroff(win, A_HEADER_GRAY);
     for (i = 0; i < vis; i++) {
         int idx = scroll + i;
@@ -95,7 +97,7 @@ static void draw_menu_strip(WINDOW *win, int menu_w, int scroll, int sel,
         attr = (idx == sel) ? A_MENU_SEL : A_MENU_NORMAL;
         wattron(win, attr);
         mvwhline(win, 1 + i, 1, ' ', content_w);
-        mvwprintw(win, 1 + i, 2, "%-*s", content_w - 2, ACTION_NAMES[idx]);
+        mvwprintw(win, 1 + i, 2, "%-*s", content_w - 2, T(ACTION_IDS[idx]));
         wattroff(win, attr);
     }
     if (needs_scroll) {
@@ -128,7 +130,7 @@ int run_menu(FilePane *p)
     WINDOW *win = NULL;
 
     for (i = 0; i < ACT_COUNT; i++) {
-        int len = utf8_strlen(ACTION_NAMES[i]);
+        int len = utf8_strlen(T(ACTION_IDS[i]));
         if (len > max_len) max_len = len;
     }
     close_key = binding_key_by_name("menu");
@@ -220,13 +222,13 @@ static void open_bookmark(const char *path)
             launch_path(base, path);
         }
     } else {
-        message_box("Ошибка", "Не удалось открыть закладку");
+        message_box(T(STR_MSG_ERROR), T(STR_BOOKMARKS_OPEN_ERR));
     }
 }
 
 static void bookmark_label(char *out, size_t outsz, const char *path)
 {
-    char shown[PATH_MAX];
+    char shown[FM_PATH_MAX];
     if (!out || outsz == 0) return;
     path_display(shown, sizeof shown, path);
     out[0] = ' ';
@@ -242,12 +244,12 @@ static void bookmarks_draw(WINDOW *win, int menu_w, int scroll, int sel, int vis
     int i;
     wattron(win, A_HEADER_GRAY);
     mvwhline(win, 0, 1, ' ', menu_w - 2);
-    mvwprintw(win, 0, (menu_w - 13) / 2, " Избранное ");
+    mvwprintw(win, 0, (menu_w - utf8_strlen(T(STR_BOOKMARKS_TITLE))) / 2, "%s", T(STR_BOOKMARKS_TITLE));
     wattroff(win, A_HEADER_GRAY);
     for (i = 0; i < vis; i++) {
         int idx = scroll + i;
         int attr;
-        char disp[PATH_MAX + 2];
+        char disp[FM_PATH_MAX + 2];
         if (idx >= g_app.bookmark_count) break;
         attr = (idx == sel) ? A_MENU_SEL : A_MENU_NORMAL;
         wattron(win, attr);
@@ -261,7 +263,7 @@ static void bookmarks_draw(WINDOW *win, int menu_w, int scroll, int sel, int vis
 static int bookmarks_menu_width(void)
 {
     int max_len = 10, i, menu_w;
-    char shown[PATH_MAX];
+    char shown[FM_PATH_MAX];
     for (i = 0; i < g_app.bookmark_count; i++) {
         int len;
         path_display(shown, sizeof shown, g_app.bookmarks[i]);
@@ -275,14 +277,15 @@ static int bookmarks_menu_width(void)
 
 static void bookmarks_delete(int sel)
 {
-    char msg[PATH_MAX + 64];
-    char shown[PATH_MAX];
+    char msg[FM_PATH_MAX + 64];
+    char shown[FM_PATH_MAX];
     int i;
     path_display(shown, sizeof shown, g_app.bookmarks[sel]);
-    snprintf(msg, sizeof msg, "Удалить закладку %.100s?", shown);
-    if (!dialog_confirm("Удаление", msg)) return;
+    snprintf(msg, sizeof msg, T(STR_BOOKMARKS_DELETE), shown);
+    if (!dialog_confirm(T(STR_DELETE_TITLE), msg)) return;
     for (i = sel; i < g_app.bookmark_count - 1; i++)
-        copy_str(g_app.bookmarks[i], PATH_MAX, g_app.bookmarks[i + 1]);
+        copy_str(g_app.bookmarks[i], sizeof g_app.bookmarks[i],
+                 g_app.bookmarks[i + 1]);
     g_app.bookmark_count--;
     save_config();
 }
@@ -295,7 +298,7 @@ void run_bookmarks_menu(void)
     WINDOW *win = NULL;
 
     if (g_app.bookmark_count == 0) {
-        message_box("Избранное", "Список пуст");
+        message_box(T(STR_BOOKMARKS_TITLE), T(STR_BOOKMARKS_EMPTY));
         return;
     }
     close_key = binding_key_by_name("bookmarks");
@@ -363,11 +366,9 @@ void run_bookmarks_menu(void)
 
 /* ==== Settings ==== */
 
-enum { SK_HEADER, SK_EMPTY, SK_RESET, SK_THEME, SK_BIND, SK_ASSOC, SK_ADD };
+typedef enum { SK_HEADER, SK_EMPTY, SK_RESET, SK_THEME, SK_BIND, SK_ASSOC, SK_ADD, SK_LANG } SettingKind;
 
 typedef struct { int kind; int id; char label[128]; } SettingItem;
-
-
 
 static int find_binding_by_key(int key, int exclude_idx)
 {
@@ -391,27 +392,48 @@ static void add_item(SettingItem *it, int *n, int kind, int id, const char *labe
 static void build_settings_items(SettingItem *items, int *count_out)
 {
     int n = 0, i;
-    add_item(items, &n, SK_HEADER, 0, "Сбросы");
-    add_item(items, &n, SK_RESET, 0, "Сбросить настройки");
-    add_item(items, &n, SK_RESET, 1, "Сбросить избранное");
-    add_item(items, &n, SK_RESET, 2, "Сбросить цвета темы");
-    add_item(items, &n, SK_RESET, 3, "Сбросить бинды");
+    char lang_item_label[128];
+
+    // Заголовок "Локализация" (или "Localization", если перевода нет)
+    const char *loc_header = T(STR_SET_LOCALIZATION);
+    if (!loc_header || !loc_header[0]) loc_header = "Localization";
+
+    // Определяем родное название языка
+    const char *native = g_app.lang;
+    if (strcmp(g_app.lang, "ru") == 0) native = "Русский";
+    else if (strcmp(g_app.lang, "en") == 0) native = "English";
+
+    snprintf(lang_item_label, sizeof lang_item_label, "%s [%s]", native, g_app.lang);
+
+    // Добавляем в меню
+    add_item(items, &n, SK_HEADER, 0, loc_header);
+    add_item(items, &n, SK_LANG, 0, lang_item_label);
     add_item(items, &n, SK_EMPTY, 0, NULL);
-    add_item(items, &n, SK_HEADER, 0, "Тема");
+
+    add_item(items, &n, SK_HEADER, 0, T(STR_SET_RESETS));
+    add_item(items, &n, SK_RESET, 0, T(STR_SET_RESET_ALL));
+    add_item(items, &n, SK_RESET, 1, T(STR_SET_RESET_FAV));
+    add_item(items, &n, SK_RESET, 2, T(STR_SET_RESET_THEME));
+    add_item(items, &n, SK_RESET, 3, T(STR_SET_RESET_BINDS));
+    add_item(items, &n, SK_EMPTY, 0, NULL);
+
+    add_item(items, &n, SK_HEADER, 0, T(STR_SET_THEME));
     for (i = 0; i < THEME_FIELDS; i++)
         add_item(items, &n, SK_THEME, i, theme_name_by_idx(i));
     add_item(items, &n, SK_EMPTY, 0, NULL);
-    add_item(items, &n, SK_HEADER, 0, "Бинды");
+
+    add_item(items, &n, SK_HEADER, 0, T(STR_SET_BINDS));
     for (i = 0; i < g_app.binding_count; i++)
         add_item(items, &n, SK_BIND, i, g_app.bindings[i].name);
     add_item(items, &n, SK_EMPTY, 0, NULL);
-    add_item(items, &n, SK_HEADER, 0, "Ассоциации файлов");
+
+    add_item(items, &n, SK_HEADER, 0, T(STR_SET_ASSOC));
     for (i = 0; i < g_app.assoc_count; i++) {
         char lab[64];
         snprintf(lab, sizeof lab, ".%s", g_app.associations[i].ext);
         add_item(items, &n, SK_ASSOC, i, lab);
     }
-    add_item(items, &n, SK_ADD, 0, "Добавить ассоциацию");
+    add_item(items, &n, SK_ADD, 0, T(STR_SET_ADD_ASSOC));
     *count_out = n;
 }
 
@@ -433,6 +455,8 @@ static void settings_draw_item(WINDOW *win, SettingItem *it, int row, int w, int
     else if (it->kind == SK_THEME) {
         char *val = theme_field_by_idx(it->id);
         mvwprintw(win, row, 2, " %-20s [%s]", it->label, val ? val : "");
+    } else if (it->kind == SK_LANG) {
+        mvwprintw(win, row, 2, " %-20s", it->label);
     } else if (it->kind == SK_BIND) {
         char kbuf[16];
         key_display_name(g_app.bindings[it->id].key, kbuf, sizeof kbuf);
@@ -450,7 +474,7 @@ static void settings_draw(WINDOW *win, SettingItem *items, int count,
     int i;
     werase(win);
     box(win, 0, 0);
-    mvwaddnstr(win, 0, 2, " Настройки ", w - 4);
+    mvwaddnstr(win, 0, 2, T(STR_SET_TITLE), w - 4);
     for (i = 0; i < vis; i++) {
         int idx = scroll + i;
         if (idx >= count) break;
@@ -474,14 +498,14 @@ static void settings_draw(WINDOW *win, SettingItem *items, int count,
                 wattroff(win, A_MENU_NORMAL);
             }
     }
-    mvwprintw(win, h - 2, 2, "j/k, Enter, d, Esc/O - выход");
+    mvwprintw(win, h - 2, 2, "%s", T(STR_SET_FOOTER));
     wrefresh(win);
 }
 
 static void perform_reset(int id)
 {
     if (id == 0) {
-        if (!dialog_confirm("Сброс", "Сбросить настройки?")) return;
+        if (!dialog_confirm(T(STR_SET_RESET_ALL), T(STR_SET_RESET_ALL_CONF))) return;
         default_config(); default_bindings();
         g_app.assoc_count = 0;
         g_theme_raw[0] = '\0'; g_new_theme_seen = 0;
@@ -490,11 +514,11 @@ static void perform_reset(int id)
         wbkgd(stdscr, COLOR_PAIR(PAIR_BG));
         refresh();
     } else if (id == 1) {
-        if (!dialog_confirm("Сброс", "Очистить избранное?")) return;
+        if (!dialog_confirm(T(STR_SET_RESET_FAV), T(STR_SET_RESET_FAV_CONF))) return;
         g_app.bookmark_count = 0;
         save_config();
     } else if (id == 2) {
-        if (!dialog_confirm("Сброс", "Сбросить цвета темы?")) return;
+        if (!dialog_confirm(T(STR_SET_RESET_THEME), T(STR_SET_RESET_THEME_CONF))) return;
         default_config();
         g_theme_raw[0] = '\0'; g_new_theme_seen = 0;
         init_attributes(); save_config();
@@ -502,7 +526,7 @@ static void perform_reset(int id)
         wbkgd(stdscr, COLOR_PAIR(PAIR_BG));
         refresh();
     } else if (id == 3) {
-        if (!dialog_confirm("Сброс", "Сбросить бинды?")) return;
+        if (!dialog_confirm(T(STR_SET_RESET_BINDS), T(STR_SET_RESET_BINDS_CONF))) return;
         default_bindings(); save_config();
     }
 }
@@ -513,9 +537,9 @@ static void edit_theme(int idx)
     char buf[16];
     if (!val) return;
     copy_str(buf, sizeof buf, val);
-    if (!dialog_input("Цвет", "Значение (hex):", buf, sizeof buf)) return;
+    if (!dialog_input(T(STR_SET_COLOR_TITLE), T(STR_SET_COLOR_PROMPT), buf, sizeof buf)) return;
     if (!theme_color_ok(buf)) {
-        message_box("Ошибка", "Нужен цвет в формате #RRGGBB");
+        message_box(T(STR_MSG_ERROR), T(STR_SET_COLOR_ERR));
         return;
     }
     copy_str(val, 8, buf);
@@ -542,8 +566,8 @@ static int capture_binding_key(int *out)
     wbkgd(win, COLOR_PAIR(PAIR_DIALOG));
     ui_prepare_win(win);
     box(win, 0, 0);
-    mvwaddn_utf8(win, 1, 2, "Нажмите клавишу", w - 4);
-    mvwaddn_utf8(win, 2, 2, "Esc — отмена", w - 4);
+    mvwaddn_utf8(win, 1, 2, T(STR_SET_BIND_PROMPT), w - 4);
+    mvwaddn_utf8(win, 2, 2, T(STR_SET_BIND_ESC), w - 4);
     wrefresh(win);
     ch = get_mapped_key(win);
     delwin(win);
@@ -564,8 +588,8 @@ static void edit_binding(int idx)
     conflict = find_binding_by_key(nk, idx);
     if (conflict >= 0) {
         key_display_name(nk, kname, sizeof kname);
-        snprintf(msg, sizeof msg, "Клавиша '%s' уже назначена на «%.80s»", kname, g_app.bindings[conflict].name);
-        message_box("Конфликт бинда", msg);
+        snprintf(msg, sizeof msg, T(STR_SET_BIND_CONFLICT_MSG), kname, g_app.bindings[conflict].name);
+        message_box(T(STR_SET_BIND_CONFLICT), msg);
         return;
     }
     g_app.bindings[idx].key = nk;
@@ -574,30 +598,77 @@ static void edit_binding(int idx)
 
 static void edit_assoc(int idx)
 {
-    char buf[PATH_MAX];
+    char buf[FM_PATH_MAX];
     copy_str(buf, sizeof buf, g_app.associations[idx].cmd);
-    if (!dialog_input("Команда", "Программа:", buf, sizeof buf)) return;
+    if (!dialog_input(T(STR_SET_ASSOC_CMD_TITLE), T(STR_SET_ASSOC_CMD_PROMPT), buf, sizeof buf)) return;
     if (!buf[0]) return;
-    copy_str(g_app.associations[idx].cmd, PATH_MAX, buf);
+    copy_str(g_app.associations[idx].cmd, sizeof g_app.associations[idx].cmd, buf);
     save_config();
 }
 
 static void add_assoc(void)
 {
-    char ext[64] = "", cmd[PATH_MAX] = "xdg-open";
+    char ext[64] = "", cmd[FM_PATH_MAX] = "xdg-open";
     char *p;
     if (g_app.assoc_count >= MAX_ASSOC) return;
-    if (!dialog_input("Новая ассоциация", "Расширение:", ext, sizeof ext)) return;
+    if (!dialog_input(T(STR_SET_ASSOC_ADD_TITLE), T(STR_SET_ASSOC_EXT_PROMPT), ext, sizeof ext)) return;
     p = ext;
     while (*p == '.') p++;
     while (*p == ' ' || *p == '\t') p++;
     if (!*p) return;
-    if (!dialog_input("Новая ассоциация", "Программа:", cmd, sizeof cmd)) return;
+    if (!dialog_input(T(STR_SET_ASSOC_ADD_TITLE), T(STR_SET_ASSOC_CMD_PROMPT), cmd, sizeof cmd)) return;
     if (!cmd[0] || !name_ok(p)) return;
-    copy_str(g_app.associations[g_app.assoc_count].ext, 32, p);
-    copy_str(g_app.associations[g_app.assoc_count].cmd, PATH_MAX, cmd);
+    copy_str(g_app.associations[g_app.assoc_count].ext,
+             sizeof g_app.associations[0].ext, p);
+    copy_str(g_app.associations[g_app.assoc_count].cmd,
+             sizeof g_app.associations[0].cmd, cmd);
     g_app.assoc_count++;
     save_config();
+}
+
+static void change_language(void)
+{
+    DIR *d = opendir(get_lang_dir());
+    struct dirent *de;
+    char options[16][64];
+    const char *ptrs[16];
+    int count = 0;
+    int current_sel = 0;
+
+    if (!d) return;
+
+    while ((de = readdir(d)) && count < 16) {
+        char *ext = strstr(de->d_name, ".txt");
+        if (ext && strlen(ext) == 4 && ext != de->d_name) {
+            size_t len = ext - de->d_name;
+            if (len < 64) {
+                memcpy(options[count], de->d_name, len);
+                options[count][len] = '\0';
+                ptrs[count] = options[count];
+                if (strcmp(options[count], g_app.lang) == 0) {
+                    current_sel = count;
+                }
+                count++;
+            }
+        }
+    }
+    closedir(d);
+
+    if (count == 0) {
+        message_box(T(STR_MSG_ERROR), T(STR_MSG_NO_LANG));
+        return;
+    }
+
+    int sel = run_submenu(T(STR_SET_LANG_SELECT), ptrs, count, current_sel);
+    if (sel >= 0) {
+        copy_str(g_app.lang, sizeof g_app.lang, ptrs[sel]);
+        load_locale_file(g_app.lang);
+        save_config();
+
+        clearok(stdscr, TRUE);
+        wbkgd(stdscr, COLOR_PAIR(PAIR_BG));
+        refresh();
+    }
 }
 
 static void handle_setting_enter(SettingItem *it)
@@ -607,6 +678,7 @@ static void handle_setting_enter(SettingItem *it)
     else if (it->kind == SK_BIND)   edit_binding(it->id);
     else if (it->kind == SK_ASSOC)  edit_assoc(it->id);
     else if (it->kind == SK_ADD)    add_assoc();
+    else if (it->kind == SK_LANG)   change_language();
 }
 
 static void delete_assoc(SettingItem *it)
@@ -614,8 +686,8 @@ static void delete_assoc(SettingItem *it)
     char msg[160];
     int i;
     if (it->kind != SK_ASSOC) return;
-    snprintf(msg, sizeof msg, "Удалить ассоциацию %.100s?", it->label);
-    if (!dialog_confirm("Удаление", msg)) return;
+    snprintf(msg, sizeof msg, T(STR_SET_ASSOC_DEL), it->label);
+    if (!dialog_confirm(T(STR_DELETE_TITLE), msg)) return;
     for (i = it->id; i < g_app.assoc_count - 1; i++)
         g_app.associations[i] = g_app.associations[i + 1];
     g_app.assoc_count--;

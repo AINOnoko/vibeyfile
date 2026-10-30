@@ -1,0 +1,20 @@
+[THEME]
+bg = #0000AA
+fg = #FFFFFF
+
+[FAVORITE]
+
+[EXECUTION]
+.png = xdg-open
+.pdf = xdg-open
+.mp4 = xdg-open
+
+[KEYBINDS]
+open = \n
+quit = q
+
+[SETTINGS]
+lang = en
+
+[HISTORY]
+active_tab = 0

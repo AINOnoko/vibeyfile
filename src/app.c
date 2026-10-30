@@ -25,7 +25,16 @@ static void suspend_self(void)
     sigemptyset(&sa.sa_mask);
     sa.sa_handler = SIG_DFL;
     sigaction(SIGTSTP, &sa, NULL);
-    raise(SIGTSTP);
+    /* raise() вернёт ненулевое, только если сигнал заблокирован — в этом
+     * случае процесс не остановится и следующий endwin()/refresh()
+     * произойдёт сразу. Проверять нечего: альтернативы «остановиться»
+     * без сигнала нет, а глотать ошибку молча — плохо, поэтому
+     * возвращаемся в тот же путь, что и при неудаче sigaction(). */
+    if (raise(SIGTSTP) != 0) {
+        install_tstp();
+        refresh();
+        return;
+    }
     install_tstp();
     refresh();
 }
@@ -126,32 +135,51 @@ static void restore_pending_selection(void)
         }
 }
 
+/* Короткая неблокирующая проверка размера. Не блокирует главный цикл:
+ * даёт пользователю возможность растянуть терминал или нажать 'q'. */
 static void show_size_warning(int rows, int cols)
 {
     int ch;
     erase();
-    mvprintw(0, 0, "Мало места: %dx%d (нужно >= %dx%d).",
-             cols, rows, MIN_COLS, MIN_ROWS);
-    mvprintw(1, 0, "Измените размер или 'q' для выхода.");
+    mvprintw(0, 0, T(STR_MSG_SMALL_TERM), cols, rows, MIN_COLS, MIN_ROWS);
+    mvprintw(1, 0, "%s", T(STR_MSG_SMALL_TERM_HINT));
     refresh();
+    timeout(100);
     ch = get_key(0);
-    if (ch == 'q' || !g_app.running) g_app.running = 0;
+    /* ФИКС: окно ожидания тоже должно знать о новом размере терминала,
+     * иначе после «развернуть» первый кадр считается по старым LINES/COLS. */
+    if (ch == KEY_RESIZE && is_term_resized(rows, cols))
+        resizeterm(rows, cols);
+    if (ch == 'q' || ch == 'Q' || !g_app.running) g_app.running = 0;
 }
 
 static void cleanup(void)
 {
-    int i;
-    for (i = 0; i < NUM_TABS; i++) {
-        free_list(&g_app.tabs[i].panes[0].list);
-        free_list(&g_app.tabs[i].panes[1].list);
-    }
+    int i, pi;
+    for (i = 0; i < NUM_TABS; i++)
+        for (pi = 0; pi < 2; pi++)
+            free_list(&g_app.tabs[i].panes[pi].list);
+    /* ЭТАП 1: буфер обмена теперь char** — освобождаем имена и вектор */
+    clipboard_clear();
+    free(g_app.clip_paths);
+    g_app.clip_paths = NULL;
     endwin();
 }
 
 int app_run(void)
 {
-    char start[PATH_MAX];
-    setlocale(LC_ALL, "");
+    char start[FM_PATH_MAX];
+    /* ФИКС (clang-tidy, cert-err33-c): setlocale() возвращает NULL, если
+     * локаль из окружения не установлена (например, LANG=ru_RU.KOI8-R на
+     * системе без этой локали). Молча продолжать в этом случае нельзя:
+     * дальше mvaddwstr()/wcwidth() считают, что работает C-локаль, и
+     * кириллица в интерфейсе рассыпается на байты. Явно откатываемся в
+     * "C.UTF-8" — она есть в любой установке glibc и хотя бы не ломает
+     * UTF-8. */
+    if (!setlocale(LC_ALL, "") && !setlocale(LC_ALL, "C.UTF-8")) {
+        /* обе локали недоступны — работаем как есть, но это уже
+         * экзотика: рисовать UTF-8 будет нельзя, и мы это не скрываем. */
+    }
     memset(&g_app, 0, sizeof(g_app));
     g_app.running = 1;
     if (!getcwd(start, sizeof start)) return 1;
@@ -164,6 +192,7 @@ int app_run(void)
     restore_pending_selection();
     while (g_app.running) {
         int rows, cols, ch;
+        int timeout_ms;
         MEVENT ev;
         getmaxyx(stdscr, rows, cols);
         if (cols < MIN_COLS || rows < MIN_ROWS) {
@@ -171,12 +200,23 @@ int app_run(void)
             continue;
         }
         draw();
+        /* Анимация бегущей строки нужна только если шапка не помещается.
+         * Иначе блокирующее чтение — меньше нагрузки и мгновенная реакция
+         * на сигналы за счёт EINTR. */
+        timeout_ms = g_app.header_scrolling ? 100 : -1;
+        timeout(timeout_ms);
         ch = get_key(g_app.search_active);
         if (!g_app.running) break;
         if (ch == ERR) continue;
         if (ch == KEY_MOUSE) {
             if (getmouse(&ev) == OK) handle_mouse(ev);
         } else if (ch == KEY_RESIZE) {
+            /* ncurses обновляет LINES/COLS после getch() сам, но окна
+             * (а их тут создают диалоги и просмотрщик) остаются со старыми
+             * размерами. resizeterm() приводит всё в порядок; если ядро
+             * ncurses отказалось — не падаем, просто просим полную
+             * перерисовку. */
+            if (is_term_resized(rows, cols)) resizeterm(rows, cols);
             clearok(stdscr, TRUE);
             refresh();
         } else {

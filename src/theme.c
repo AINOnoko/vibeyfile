@@ -2,6 +2,7 @@
 
 AppState    g_app;
 ThemeConfig g_theme;
+char *g_theme_field[THEME_FIELDS];
 char        g_theme_raw[4096] = "";
 int         g_new_theme_seen = 0;
 
@@ -65,6 +66,11 @@ void default_config(void)
 
     snprintf(g_theme.btn_book_bg, 8, "#00AAAA"); /* Темно-бирюзовый */
     snprintf(g_theme.btn_book_fg, 8, "#FFFFFF");
+    /* Таблица «индекс → поле» должна быть готова ДО разбора
+     * конфига: parse_theme_line() достаёт поля через
+     * theme_field_by_idx(). Раньше вызов стоял только в
+     * init_attributes(), то есть уже после load_config(). */
+    theme_bind_fields();
 }
 
 int theme_color_ok(const char *hex)
@@ -76,14 +82,34 @@ int theme_color_ok(const char *hex)
     return 1;
 }
 
+/* ФИКС (clang-tidy, cert-err34-c): "на вид hex" и "число" — разные вещи.
+ * theme_color_ok() проверяет только символы, а sscanf("%02x%02x%02x")
+ * вернёт 3 и для «#12345g», если бы такая строка прошла проверку выше, —
+ * то есть корректность обеспечивалась ДВУМЯ разными проверками в двух
+ * местах. Разбор цифр теперь тут же и вручную: каждой цифре соответствует
+ * один nibble, результат не зависит от локали и не может «прочитаться
+ * частично». */
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static int parse_hex(const char *hex, int *r, int *g, int *b)
 {
-    unsigned int ur, ug, ub;
+    int v[3] = {0, 0, 0}, i;
     if (!theme_color_ok(hex)) return 0;
-    if (sscanf(hex + 1, "%02x%02x%02x", &ur, &ug, &ub) != 3) return 0;
-    *r = (int)ur;
-    *g = (int)ug;
-    *b = (int)ub;
+    for (i = 0; i < 3; i++) {
+        int hi = hex_nibble(hex[1 + i * 2]);
+        int lo = hex_nibble(hex[2 + i * 2]);
+        if (hi < 0 || lo < 0) return 0;   /* недостижимо: theme_color_ok */
+        v[i] = hi * 16 + lo;
+    }
+    *r = v[0];
+    *g = v[1];
+    *b = v[2];
     return 1;
 }
 
@@ -97,14 +123,19 @@ int color_to_256(const char *hex)
     return 16 + (36 * cr) + (6 * cg) + cb;
 }
 
-static int clamp_color(int c)
+/* ФИКС (clang-tidy, bugprone-narrowing-conversions): init_pair() принимает
+ * short, поэтому весь путь «hex → номер пары» теперь short, а не int.
+ * Раньше сужение происходило неявно на каждом из 20 вызовов init_pair и
+ * формально было implementation-defined. Значение всегда в [0, COLORS-1],
+ * так что приведение безопасно и теперь явное в одной точке. */
+static short clamp_color(int c)
 {
     if (c < 0) return 0;
-    if (COLORS > 0 && c >= COLORS) return COLORS - 1;
-    return c;
+    if (COLORS > 0 && c >= COLORS) return (short)(COLORS - 1);
+    return (short)c;
 }
 
-static int theme_color(const char *hex)
+static short theme_color(const char *hex)
 {
     static const int pal[16][3] = {
         {0, 0, 0},       {170, 0, 0},     {0, 170, 0},     {170, 85, 0},
@@ -127,44 +158,58 @@ static int theme_color(const char *hex)
     return clamp_color(best);
 }
 
+/* ФИКС (clang-tidy, bugprone-branch-clone): 32 почти одинаковых `case`
+ * заменены таблицей. Раньше это был switch на 33 ветки — компилятор
+ * разворачивал его в сравнения, а любая правка (добавили поле в
+ * ThemeConfig — забыли ветку) давала NULL в рантайме. Теперь соответствие
+ * «индекс ↔ поле» задаётся один раз списком, и добавление поля в конец
+ * массива видно ровно в одном месте. */
 char *theme_field_by_idx(int idx)
 {
-    switch (idx) {
-    case 0:  return g_theme.bg;
-    case 1:  return g_theme.fg;
-    case 2:  return g_theme.sel_bg;
-    case 3:  return g_theme.sel_fg;
-    case 4:  return g_theme.sel_inactive_bg;
-    case 5:  return g_theme.sel_inactive_fg;
-    case 6:  return g_theme.marked_bg;
-    case 7:  return g_theme.marked_fg;
-    case 8:  return g_theme.dir;
-    case 9:  return g_theme.exec;
-    case 10: return g_theme.header_bg;
-    case 11: return g_theme.header_fg;
-    case 12: return g_theme.title_bg;
-    case 13: return g_theme.title_fg;
-    case 14: return g_theme.tab_active_bg;
-    case 15: return g_theme.tab_active_fg;
-    case 16: return g_theme.tab_inactive_bg;
-    case 17: return g_theme.tab_inactive_fg;
-    case 18: return g_theme.status_bg;
-    case 19: return g_theme.status_fg;
-    case 20: return g_theme.dialog_bg;
-    case 21: return g_theme.dialog_fg;
+    if (idx < 0 || idx >= THEME_FIELDS) return NULL;
+    return g_theme_field[idx];
+}
 
-    case 22: return g_theme.btn_quit_bg;
-    case 23: return g_theme.btn_quit_fg;
-    case 24: return g_theme.btn_menu_bg;
-    case 25: return g_theme.btn_menu_fg;
-    case 26: return g_theme.btn_help_bg;
-    case 27: return g_theme.btn_help_fg;
-    case 28: return g_theme.btn_set_bg;
-    case 29: return g_theme.btn_set_fg;
-    case 30: return g_theme.btn_book_bg;
-    case 31: return g_theme.btn_book_fg;
-    }
-    return NULL;
+/* Заполняет таблицу адресами полей ThemeConfig. Вызывается один раз после
+ * смены темы: адреса постоянны (поля — массивы внутри g_theme), но
+ * инициализация в рантайме, а не статической константой, потому что
+ * g_theme — не constexpr-объект. */
+void theme_bind_fields(void)
+{
+    int i = 0;
+    g_theme_field[i++] = g_theme.bg;
+    g_theme_field[i++] = g_theme.fg;
+    g_theme_field[i++] = g_theme.sel_bg;
+    g_theme_field[i++] = g_theme.sel_fg;
+    g_theme_field[i++] = g_theme.sel_inactive_bg;
+    g_theme_field[i++] = g_theme.sel_inactive_fg;
+    g_theme_field[i++] = g_theme.marked_bg;
+    g_theme_field[i++] = g_theme.marked_fg;
+    g_theme_field[i++] = g_theme.dir;
+    g_theme_field[i++] = g_theme.exec;
+    g_theme_field[i++] = g_theme.header_bg;
+    g_theme_field[i++] = g_theme.header_fg;
+    g_theme_field[i++] = g_theme.title_bg;
+    g_theme_field[i++] = g_theme.title_fg;
+    g_theme_field[i++] = g_theme.tab_active_bg;
+    g_theme_field[i++] = g_theme.tab_active_fg;
+    g_theme_field[i++] = g_theme.tab_inactive_bg;
+    g_theme_field[i++] = g_theme.tab_inactive_fg;
+    g_theme_field[i++] = g_theme.status_bg;
+    g_theme_field[i++] = g_theme.status_fg;
+    g_theme_field[i++] = g_theme.dialog_bg;
+    g_theme_field[i++] = g_theme.dialog_fg;
+    g_theme_field[i++] = g_theme.btn_quit_bg;
+    g_theme_field[i++] = g_theme.btn_quit_fg;
+    g_theme_field[i++] = g_theme.btn_menu_bg;
+    g_theme_field[i++] = g_theme.btn_menu_fg;
+    g_theme_field[i++] = g_theme.btn_help_bg;
+    g_theme_field[i++] = g_theme.btn_help_fg;
+    g_theme_field[i++] = g_theme.btn_set_bg;
+    g_theme_field[i++] = g_theme.btn_set_fg;
+    g_theme_field[i++] = g_theme.btn_book_bg;
+    g_theme_field[i++] = g_theme.btn_book_fg;
+    while (i < THEME_FIELDS) g_theme_field[i++] = NULL;
 }
 
 const char *theme_name_by_idx(int idx)
@@ -187,8 +232,8 @@ const char *theme_name_by_idx(int idx)
 
 static void init_pairs_from_theme(void)
 {
-    int bg = theme_color(g_theme.bg);
-    int fg = theme_color(g_theme.fg);
+    short bg = theme_color(g_theme.bg);
+    short fg = theme_color(g_theme.fg);
     init_pair(PAIR_BG,           fg, bg);
     init_pair(PAIR_SEL_ACTIVE,
               theme_color(g_theme.sel_fg),
@@ -265,6 +310,7 @@ static void set_attrs_fallback(void)
 
 void init_attributes(void)
 {
+    theme_bind_fields();
     if (has_colors()) {
         start_color();
         use_default_colors();

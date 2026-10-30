@@ -3,41 +3,12 @@
 #define HELP_MAX_LINES 64
 #define HELP_LINE_MAX  512
 
-static int binary_sample(int fd)
-{
-    unsigned char buf[512];
-    size_t n = 0, i, bad = 0;
-    while (n < sizeof buf) {
-        ssize_t got = read(fd, buf + n, sizeof buf - n);
-        if (got < 0 && errno == EINTR) continue;
-        if (got <= 0) break;
-        n += (size_t)got;
-    }
-    for (i = 0; i < n; i++) {
-        unsigned char c = buf[i];
-        if (c == 0) return 1;
-        if (c < 9 || (c > 13 && c < 32) || c == 127) bad++;
-    }
-    return n > 0 && bad * 5 > n;
-}
-
-int is_binary_content(const char *path)
-{
-    struct stat st;
-    int fd, bin;
-    if (!path) return 1;
-    fd = open(path, O_RDONLY);
-    if (fd < 0) return 1;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        close(fd);
-        return 1;
-    }
-    if (st.st_size == 0) { close(fd); return 0; }
-    bin = binary_sample(fd);
-    close(fd);
-    return bin;
-}
-
+/* ФИКС: здесь жили binary_sample() и is_binary_content() — вторая, более
+ * слабая реализация того же самого. Она возвращала «бинарник» на первый же
+ * NUL, поэтому UTF-16/32 текст (а он весь в нулях) через явный просмотр
+ * отвергался, а через action_open — открывался: два разных ответа на один
+ * и тот же файл. Теперь единственная реализация — fm_content_is_binary()
+ * из exec.c (BOM → структурные нули → решение). */
 typedef struct { char **lines; int count; int cap; int max_width; } FileLines;
 
 static int push_line(FileLines *fl, const char *line)
@@ -45,7 +16,9 @@ static int push_line(FileLines *fl, const char *line)
     char *dup;
     if (fl->count == fl->cap) {
         int ncap = fl->cap ? fl->cap * 2 : 256;
-        char **tmp = realloc(fl->lines, ncap * sizeof(char *));
+        /* C: void* → char** преобразуется неявно и корректно, приведение
+         * только скрыло бы ошибку уровня указателя. Ложное по правилам C++. */
+        char **tmp = realloc(fl->lines, (size_t)ncap * sizeof(char *));
         if (!tmp) return -1;
         fl->lines = tmp;
         fl->cap = ncap;
@@ -73,7 +46,7 @@ static void free_lines(FileLines *fl)
 
 static int read_all_lines(const char *path, FileLines *fl)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "re");
     char *line = NULL;
     size_t line_len = 0;
     ssize_t n;
@@ -88,17 +61,17 @@ static int read_all_lines(const char *path, FileLines *fl)
     if (ferror(f)) rc = -1;
 cleanup:
     free(line);
-    fclose(f);
+    (void)fclose(f);
     if (rc != 0) free_lines(fl);
     return rc;
 }
 
 static void view_draw_title(WINDOW *win, int cols, const char *base)
 {
-    char title[PATH_MAX + 32];
+    char title[FM_PATH_MAX + 32];
     wattron(win, A_TITLE);
     mvwhline(win, 0, 0, ' ', cols);
-    snprintf(title, sizeof title, " %s ", base ? base : "");
+    snprintf(title, sizeof title, T(STR_VIEW_TITLE), base ? base : "");
     mvwaddn_utf8(win, 0, 1, title, cols > 4 ? cols - 4 : 1);
     wattroff(win, A_TITLE);
 }
@@ -159,11 +132,10 @@ static void view_draw_status(WINDOW *win, const char *base, int scroll,
     wattron(win, COLOR_PAIR(PAIR_STATUS));
     mvwhline(win, rows - 1, 0, ' ', cols);
     if (max_h > 0)
-        snprintf(status, sizeof status,
-                 " %s | %d/%d | x:%d | h/l, ←/→ - сдвиг, q/Esc - выход",
+        snprintf(status, sizeof status, T(STR_VIEW_HINT_H),
                  base, scroll + 1, count, h_scroll);
     else
-        snprintf(status, sizeof status, " %s | %d/%d | q/Esc - выход",
+        snprintf(status, sizeof status, T(STR_VIEW_HINT),
                  base, scroll + 1, count);
     mvwaddn_utf8(win, rows - 1, 1, status, cols > 2 ? cols - 2 : 1);
     wattroff(win, COLOR_PAIR(PAIR_STATUS));
@@ -213,28 +185,33 @@ static int view_handle_key(int ch, int *scroll, int *h_scroll, int vis, int tota
     return 1;
 }
 
+/* Проверка перед просмотром. ФИКС: тот же сниффер, что и в action_open —
+ * состояние файла больше не зависит от того, какой клавишей его открыли. */
 static int view_gate(const char *path, struct stat *st)
 {
     int fd;
     if (!path) return -1;
-    fd = open(path, O_RDONLY);
-    if (fd < 0 || fstat(fd, st) != 0) {
-        if (fd >= 0) close(fd);
-        message_box("Ошибка", "Не удалось открыть файл");
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        message_box(T(STR_MSG_ERROR), T(STR_VIEW_ERR_OPEN));
+        return -1;
+    }
+    if (fstat(fd, st) != 0) {
+        close(fd);
+        message_box(T(STR_MSG_ERROR), T(STR_VIEW_ERR_OPEN));
         return -1;
     }
     close(fd);
     if (!S_ISREG(st->st_mode)) {
-        message_box("Просмотр", "Это не обычный файл");
+        message_box(T(STR_MSG_ERROR), T(STR_MSG_NOT_REGULAR));
         return -1;
     }
     if (st->st_size > VIEW_MAX_SIZE) {
-        message_box("Слишком большой файл",
-                    "Файл больше 5 МБ. Используйте внешний просмотрщик.");
+        message_box(T(STR_MSG_ATTENTION), T(STR_VIEW_ERR_BIG));
         return -1;
     }
-    if (is_binary_content(path)) {
-        message_box("Просмотр", "Двоичный файл. Откройте внешней программой.");
+    if (fm_content_is_binary(path)) {
+        message_box(T(STR_MSG_ATTENTION), T(STR_PREVIEW_BINARY));
         return -1;
     }
     return 0;
@@ -288,12 +265,12 @@ void view_file(const char *path)
     const char *base;
     if (view_gate(path, &st) != 0) return;
     if (read_all_lines(path, &fl) != 0) {
-        message_box("Ошибка", "Недостаточно памяти для просмотра файла");
+        message_box(T(STR_MSG_ERROR), T(STR_VIEW_ERR_MEM));
         return;
     }
     if (fl.count == 0) {
         free_lines(&fl);
-        message_box("Просмотр", "Файл пуст");
+        message_box(T(STR_MSG_ATTENTION), T(STR_VIEW_ERR_EMPTY));
         return;
     }
     win = view_open_win(&rows, &cols, &vis);
@@ -343,10 +320,9 @@ static void help_draw_footer(WINDOW *win, int total, int scroll, int vis, int h,
 {
     char footer[128];
     if (total > vis)
-        snprintf(footer, sizeof footer, "j/k, PgUp/PgDn | q/Esc [%d/%d]",
-                 scroll + 1, total - vis + 1);
+        snprintf(footer, sizeof footer, T(STR_VIEW_HELP_FOOTER), scroll + 1, total - vis + 1);
     else
-        snprintf(footer, sizeof footer, "q/Esc - выход");
+        snprintf(footer, sizeof footer, "%s", T(STR_VIEW_HELP_FOOTER_SHORT));
     mvwaddn_utf8(win, h - 2, 2, footer, w > 4 ? w - 4 : 1);
 }
 
@@ -355,7 +331,7 @@ static void help_draw(WINDOW *win, const char **lines, int total,
 {
     werase(win);
     box(win, 0, 0);
-    mvwaddnstr(win, 0, 2, " Справка ", w - 4);
+    mvwaddnstr(win, 0, 2, T(STR_VIEW_HELP_TITLE), w - 4);
     help_draw_lines(win, lines, total, scroll, vis, w);
     help_draw_bar(win, total, scroll, vis, h, w);
     help_draw_footer(win, total, scroll, vis, h, w);
@@ -418,53 +394,51 @@ static int help_pushf(char store[][HELP_LINE_MAX], const char **lines, int n,
 
 static int help_fill_banner(char store[][HELP_LINE_MAX], const char **lines, int n)
 {
-    n = help_push(store, lines, n, "========================================================================");
-    n = help_push(store, lines, n, "__     __  ___   ____   _____  __   __  _____   ___   _      _____ ");
-    n = help_push(store, lines, n, "\\\\ \\\\   / / |_ _| | __ ) | ____| \\\\ \\\\ / / |  ___| |_ _| | |    | ____|");
-    n = help_push(store, lines, n, " \\\\ \\\\ / /   | |  |  _ \\\\ |  _|    \\\\ V /  | |_     | |  | |    |  _|  ");
-    n = help_push(store, lines, n, "  \\\\ V /    | |  | |_) || |___    | |   |  _|    | |  | |___ | |___ ");
-    n = help_push(store, lines, n, "   \\\\_/    |___| |____/ |_____|   |_|   |_|     |___| |_____||_____|");
+    n = help_push(store, lines, n, T(STR_HELP_BANNER_1));
+    n = help_push(store, lines, n, T(STR_HELP_BANNER_2));
+    n = help_push(store, lines, n, T(STR_HELP_BANNER_3));
+    n = help_push(store, lines, n, T(STR_HELP_BANNER_4));
+    n = help_push(store, lines, n, T(STR_HELP_BANNER_5));
+    n = help_push(store, lines, n, T(STR_HELP_BANNER_6));
     n = help_push(store, lines, n, "");
-    return help_push(store, lines, n, "========================================================================");
+    return help_push(store, lines, n, T(STR_HELP_BANNER_1));
 }
 
 static int help_fill_nav(char store[][HELP_LINE_MAX], const char **lines, int n, const HelpKeys *k)
 {
     n = help_push(store, lines, n, "");
-    n = help_push(store, lines, n, "Навигация:");
-    n = help_pushf(store, lines, n, "  %s/↓, %s/↑ - Вверх / Вниз", k->down, k->up);
-    n = help_pushf(store, lines, n, "  %s/←/Backspace - Вверх по каталогам", k->parent, "");
-    n = help_pushf(store, lines, n, "  %s/%s/→/Enter - Войти / Открыть", k->open_l, k->open);
-    n = help_pushf(store, lines, n, "  %s / %s - В начало / В конец списка", k->home, k->end);
-    n = help_push(store, lines, n, "  Tab - Переключение панелей (в сплите)");
-    n = help_pushf(store, lines, n, "  %s - Выделить / Снять выделение", k->select_, "");
+    n = help_push(store, lines, n, T(STR_HELP_NAV_TITLE));
+    n = help_pushf(store, lines, n, T(STR_HELP_NAV_DOWN), k->down, k->up);
+    n = help_pushf(store, lines, n, T(STR_HELP_NAV_PARENT), k->parent, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_NAV_OPEN), k->open_l, k->open);
+    n = help_pushf(store, lines, n, T(STR_HELP_NAV_HOME), k->home, k->end);
+    n = help_push(store, lines, n, T(STR_HELP_NAV_TAB));
+    n = help_pushf(store, lines, n, T(STR_HELP_NAV_SELECT), k->select_, "");
     return help_push(store, lines, n, "");
 }
 
 static int help_fill_acts(char store[][HELP_LINE_MAX], const char **lines, int n, const HelpKeys *k)
 {
-    n = help_push(store, lines, n, "Действия и вкладки:");
-    n = help_pushf(store, lines, n, "  %s - Меню действий", k->menu, "");
-    n = help_pushf(store, lines, n, "  %s / [=] - Избранное", k->book, "");
-    n = help_push(store, lines, n,
-                  "  Избранное: папка, если ничего не отмечено; иначе только отмеченное");
-    n = help_push(store, lines, n,
-                  "  Документы, Загрузки, Видео и т.п. — если избранное ещё пустое");
-    n = help_pushf(store, lines, n, "  %s / [O] - Настройки", k->sett, "");
-    n = help_pushf(store, lines, n, "  %s - Вкл/выкл сплит", k->split, "");
-    n = help_pushf(store, lines, n, "  %s - Вкл/выкл предпросмотр", k->prev, "");
-    n = help_pushf(store, lines, n, "  %s / %s - Сортировка / Реверс", k->sortn, k->sortr);
-    n = help_pushf(store, lines, n, "  %s - Поиск по имени", k->search, "");
-    n = help_pushf(store, lines, n, "  %s - Обновить список", k->ref, "");
-    n = help_pushf(store, lines, n, "  %s - Перерисовать экран", k->full, "");
-    n = help_push(store, lines, n, "  F1..F4 - Переключение вкладок");
-    n = help_pushf(store, lines, n, "  %s / [X] - Выход", k->quit, "");
-    n = help_pushf(store, lines, n, "  %s - Эта справка", k->help, "");
+    n = help_push(store, lines, n, T(STR_HELP_ACT_TITLE));
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_MENU), k->menu, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_BOOK), k->book, "");
+    n = help_push(store, lines, n, T(STR_HELP_ACT_BOOK_INFO));
+    n = help_push(store, lines, n, T(STR_HELP_ACT_BOOK_INFO2));
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_SETT), k->sett, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_SPLIT), k->split, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_PREV), k->prev, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_SORT), k->sortn, k->sortr);
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_SEARCH), k->search, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_REFRESH), k->ref, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_FULL), k->full, "");
+    n = help_push(store, lines, n, T(STR_HELP_ACT_TABS));
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_QUIT), k->quit, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_ACT_HELP), k->help, "");
     n = help_push(store, lines, n, "");
-    n = help_pushf(store, lines, n, "Клавиши можно переназначить в Настройках (%s).", k->sett, "");
+    n = help_pushf(store, lines, n, T(STR_HELP_KEYBIND_HINT), k->sett, "");
     n = help_push(store, lines, n, "");
-    n = help_push(store, lines, n, "Разработано AINOnoko с помощью ИИ.");
-    return help_push(store, lines, n, "VibeyFile распространяется под лицензией GPLv3.");
+    n = help_push(store, lines, n, T(STR_HELP_CREDITS));
+    return help_push(store, lines, n, T(STR_HELP_LICENSE));
 }
 
 static int help_widest(const char **lines, int total)
